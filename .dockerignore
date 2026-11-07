@@ -1,0 +1,5 @@
+target
+dist
+.git
+# rust-toolchain.toml requests musl and Windows targets the container does not need.
+rust-toolchain.toml

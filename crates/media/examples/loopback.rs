@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use chattercrab_media::audio::{
-    AudioInput, AudioOutput, FRAME_SAMPLES, MAX_OPUS_PACKET, new_opus_encoder,
+    AudioInput, AudioOutput, FRAME_SAMPLES, MAX_OPUS_PACKET, ShareMix, new_opus_encoder,
 };
 use chattercrab_media::mixer::{MixerControl, MixerHandle, PeerSlot, RtpAudioPacket};
 use chattercrab_protocol::PeerId;
@@ -154,7 +154,8 @@ fn run() -> Result<(), String> {
     } else {
         let muted = Arc::new(AtomicBool::new(false));
         let denoise = Arc::new(AtomicBool::new(args.denoise));
-        let input = AudioInput::start(None, muted, denoise, level.clone())
+        let gain = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let input = AudioInput::start(None, muted, denoise, gain, ShareMix::new(), level.clone())
             .map_err(|e| format!("cannot open the microphone: {e} (or run with --tone)"))?;
         Source::Mic(Box::new(input))
     };

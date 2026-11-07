@@ -773,6 +773,7 @@ name = "chattercrab-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "bytes",
  "chattercrab-media",
  "chattercrab-protocol",
@@ -780,6 +781,7 @@ dependencies = [
  "embed-resource",
  "futures-util",
  "iced",
+ "iced_runtime",
  "reqwest",
  "rustls",
  "serde",
@@ -805,6 +807,7 @@ dependencies = [
  "crossbeam-queue",
  "fast_image_resize",
  "futures-util",
+ "libloading",
  "nnnoiseless",
  "openh264",
  "opus",
@@ -814,6 +817,7 @@ dependencies = [
  "rtc",
  "rubato",
  "rustls",
+ "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
@@ -821,6 +825,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webrtc",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
  "xcap",
 ]
 
@@ -846,14 +852,12 @@ dependencies = [
  "dashmap",
  "futures-util",
  "governor",
- "hmac 0.13.0",
  "rand 0.10.3",
  "rcgen",
  "reqwest",
  "rustls",
  "serde",
  "serde_json",
- "sha1 0.11.0",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
@@ -923,12 +927,6 @@ checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
 dependencies = [
  "cc",
 ]
-
-[[package]]
-name = "cmov"
-version = "0.5.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "codespan-reporting"
@@ -1234,15 +1232,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ctutils"
-version = "0.4.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "261af4dc7a06ea8a527a8717d8cbba3417530d6ea14e1edb3de6b67806be474f"
-dependencies = [
- "cmov",
-]
-
-[[package]]
 name = "cursor-icon"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1328,7 +1317,6 @@ dependencies = [
  "block-buffer 0.12.1",
  "const-oid",
  "crypto-common 0.2.2",
- "ctutils",
 ]
 
 [[package]]
@@ -2180,15 +2168,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
 dependencies = [
  "digest 0.10.7",
-]
-
-[[package]]
-name = "hmac"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
-dependencies = [
- "digest 0.11.3",
 ]
 
 [[package]]
@@ -4567,7 +4546,7 @@ dependencies = [
  "aes",
  "ccm",
  "ctr",
- "hmac 0.12.1",
+ "hmac",
  "md-5",
  "rand 0.10.3",
  "ring",

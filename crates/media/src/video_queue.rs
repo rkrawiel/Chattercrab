@@ -1,11 +1,15 @@
-//! Drop-oldest queue for decoded video frames.
+//! Queue of decoded video frames for the UI.
+//!
+//! The queue holds two pictures. A full queue refuses the new frame instead of
+//! dropping one that is already waiting, so the playout clock can wait and keep
+//! the stream smooth.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
-use crossbeam_queue::ArrayQueue;
 use tokio::sync::Notify;
 
-/// Number of decoded frames buffered before the oldest is dropped.
+/// Number of decoded frames the UI may have queued.
 pub const VIDEO_QUEUE_CAPACITY: usize = 2;
 
 /// A decoded RGBA8 frame.
@@ -19,16 +23,18 @@ pub struct RgbaFrame {
     pub pixels: Arc<[u8]>,
 }
 
-/// Bounded queue of decoded frames (capacity 2). Pushing into a full queue drops the
-/// oldest frame, so a slow UI always shows the most recent picture.
-#[derive(Debug, Clone)]
+/// Bounded queue of decoded frames (capacity [`VIDEO_QUEUE_CAPACITY`]).
+#[derive(Debug)]
 pub struct VideoFrameQueue {
     inner: Arc<Inner>,
 }
 
 #[derive(Debug)]
 struct Inner {
-    frames: ArrayQueue<RgbaFrame>,
+    frames: Mutex<VecDeque<RgbaFrame>>,
+    /// Wakes [`VideoFrameQueue::push`] when a slot frees up.
+    space: Condvar,
+    /// Wakes [`VideoFrameQueue::next`].
     notify: Notify,
 }
 
@@ -38,37 +44,88 @@ impl Default for VideoFrameQueue {
     }
 }
 
+impl Clone for VideoFrameQueue {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
 impl VideoFrameQueue {
     /// Creates an empty queue.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Inner {
-                frames: ArrayQueue::new(VIDEO_QUEUE_CAPACITY),
+                frames: Mutex::new(VecDeque::with_capacity(VIDEO_QUEUE_CAPACITY)),
+                space: Condvar::new(),
                 notify: Notify::new(),
             }),
         }
     }
 
-    /// Pushes a frame, dropping the oldest one if the queue is full.
+    /// Queues `frame`, waiting while the queue is full.
     pub fn push(&self, frame: RgbaFrame) {
-        let _dropped = self.inner.frames.force_push(frame);
+        let mut frame = Some(frame);
+        let mut guard = lock(&self.inner.frames);
+        loop {
+            if guard.len() < VIDEO_QUEUE_CAPACITY {
+                if let Some(frame) = frame.take() {
+                    guard.push_back(frame);
+                }
+                drop(guard);
+                self.inner.notify.notify_one();
+                return;
+            }
+            guard = self
+                .inner
+                .space
+                .wait(guard)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    /// Queues `frame` if there is room. Returns the frame when the queue is full.
+    pub fn try_push(&self, frame: RgbaFrame) -> Result<(), RgbaFrame> {
+        let mut guard = lock(&self.inner.frames);
+        if guard.len() >= VIDEO_QUEUE_CAPACITY {
+            return Err(frame);
+        }
+        guard.push_back(frame);
+        drop(guard);
         self.inner.notify.notify_one();
+        Ok(())
+    }
+
+    /// Drops every queued frame.
+    pub fn clear(&self) {
+        lock(&self.inner.frames).clear();
+        self.inner.space.notify_all();
     }
 
     /// Takes the oldest frame without waiting.
     pub fn try_pop(&self) -> Option<RgbaFrame> {
-        self.inner.frames.pop()
+        let frame = lock(&self.inner.frames).pop_front()?;
+        self.inner.space.notify_one();
+        Some(frame)
     }
 
     /// Waits for the next frame.
     pub async fn next(&self) -> RgbaFrame {
         loop {
-            if let Some(frame) = self.inner.frames.pop() {
+            let notified = self.inner.notify.notified();
+            if let Some(frame) = self.try_pop() {
                 return frame;
             }
-            self.inner.notify.notified().await;
+            notified.await;
         }
     }
+}
+
+fn lock(frames: &Mutex<VecDeque<RgbaFrame>>) -> MutexGuard<'_, VecDeque<RgbaFrame>> {
+    frames
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
@@ -84,13 +141,13 @@ mod tests {
     }
 
     #[test]
-    fn drops_oldest_when_full() {
+    fn full_queue_keeps_the_frames_already_waiting() {
         let q = VideoFrameQueue::new();
-        q.push(frame(1));
-        q.push(frame(2));
-        q.push(frame(3));
+        assert!(q.try_push(frame(1)).is_ok());
+        assert!(q.try_push(frame(2)).is_ok());
+        assert!(q.try_push(frame(3)).is_err());
+        assert_eq!(q.try_pop().map(|f| f.width), Some(1));
         assert_eq!(q.try_pop().map(|f| f.width), Some(2));
-        assert_eq!(q.try_pop().map(|f| f.width), Some(3));
         assert!(q.try_pop().is_none());
     }
 

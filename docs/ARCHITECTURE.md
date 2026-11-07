@@ -3,16 +3,21 @@
 Chattercrab is a minimalist peer-to-peer voice, text and screen-share application.
 Everything is written in Rust. A small signaling server coordinates rooms and relays
 SDP/ICE messages and chat; all audio and video flows directly between peers over
-WebRTC (or through the operator's Coturn TURN server when a direct path is impossible).
-The signaling server never touches media.
+WebRTC. On a VPS, Traefik terminates TLS and proxies to `chattercrab-signal`, which
+speaks plain HTTP on the Compose network. Clients use an external STUN server for
+server-reflexive candidates. Media is direct peer-to-peer. Peers that cannot establish
+a direct path do not get a relay. The signaling server never touches media.
 
 ## 1. Components
 
 ```mermaid
 flowchart LR
-    subgraph VPS["Linux VPS (bare metal, systemd)"]
-        SIG["chattercrab-signal<br/>axum + rustls<br/>:8443 HTTPS/WSS"]
-        TURN["coturn<br/>:3478 udp/tcp<br/>:5349 tls<br/>49152-49999 udp relay"]
+    STUN["External STUN<br/>stun:stun.l.google.com:19302"]
+
+    subgraph VPS["Linux VPS (Docker Compose)"]
+        TR["Traefik<br/>:443 TLS"]
+        SIG["chattercrab-signal<br/>plain HTTP on the compose network"]
+        TR --> SIG
     end
 
     subgraph A["Client A (chattercrab)"]
@@ -25,24 +30,25 @@ flowchart LR
         RTC["net/media runtime"]
     end
 
-    RTA -- "REST + WSS (signaling, chat)" --> SIG
-    RTB -- "REST + WSS" --> SIG
-    RTC -- "REST + WSS" --> SIG
+    RTA -- "HTTPS + WSS (signaling, chat)" --> TR
+    RTB -- "HTTPS + WSS" --> TR
+    RTC -- "HTTPS + WSS" --> TR
+
+    RTA -. "STUN" .-> STUN
+    RTB -. "STUN" .-> STUN
+    RTC -. "STUN" .-> STUN
 
     RTA <-. "SRTP (Opus, H.264), full mesh" .-> RTB
     RTA <-. "SRTP" .-> RTC
     RTB <-. "SRTP" .-> RTC
-
-    RTA -. "fallback relay" .- TURN
-    RTB -. "fallback relay" .- TURN
 ```
 
-| Crate | Kind | Responsibility |
-|-------|------|----------------|
-| `chattercrab-protocol` | library | Shared serde types for REST and WebSocket messages. Validation newtypes. No I/O. |
-| `chattercrab-server` | binary `chattercrab-signal` | Rooms, membership, signaling relay, chat history, screen-share arbitration, TURN REST credentials. |
-| `chattercrab-media` | library | Audio capture/encode, jitter buffers, mixer, playback, screen capture/encode/decode, WebRTC peer management. Message-based API. |
-| `chattercrab-client` | binary `chattercrab` | iced desktop UI, configuration, signaling client, reconnect logic. Drives `chattercrab-media` through commands and events. |
+| Crate                  | Kind                        | Responsibility                                                                                                                             |
+| ---------------------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `chattercrab-protocol` | library                     | Shared serde types for REST and WebSocket messages. Validation newtypes. No I/O.                                                           |
+| `chattercrab-server`   | binary `chattercrab-signal` | Rooms, membership, signaling relay, chat history, screen-share arbitration. Clients receive one external STUN URL from `GET /ice-servers`. |
+| `chattercrab-media`    | library                     | Audio capture/encode, jitter buffers, mixer, playback, screen capture/encode/decode, WebRTC peer management. Message-based API.            |
+| `chattercrab-client`   | binary `chattercrab`        | iced desktop UI, configuration, signaling client, reconnect logic. Drives `chattercrab-media` through commands and events.                 |
 
 Dependency graph: `client -> media -> protocol`, `client -> protocol`, `server -> protocol`.
 The server never depends on the media crate, which keeps the server binary small and
@@ -50,14 +56,18 @@ free of native audio/video libraries.
 
 ## 2. Topology and scale
 
-* Full mesh: with `N` participants each client maintains `N - 1` peer connections.
+- Full mesh: with `N` participants each client maintains `N - 1` peer connections.
   The design target is 4 to 5 participants per room (`CHATTERCRAB_MAX_ROOM_SIZE`, default 5).
-* Upstream cost per client: `(N - 1) x 32 kbps` of Opus, plus `(N - 1) x ~1.5 Mbps` while
+- Upstream cost per client: `(N - 1) x 96 kbps` of Opus, plus `(N - 1) x ~1.5 Mbps` while
   that client is the screen publisher. With 5 participants a publisher needs about 6 Mbps up.
-* At most one screen publisher per room. The server is the arbiter (section 5.3), which
+- At most one screen publisher per room. The server is the arbiter (section 5.3), which
   keeps the mesh upstream bounded and the UI simple.
 
 ## 3. Signaling server
+
+When `CHATTERCRAB_PASSWORD` is set, the signaling server requires a shared HTTP Basic
+credential on every route except `GET /health` and CORS preflight. `GET /health` stays
+open. Peers still exchange media directly; the password only guards signaling.
 
 ### 3.1 State
 
@@ -94,11 +104,11 @@ classDiagram
     RoomInner --> Member
 ```
 
-* There is no global lock. The `DashMap` shards protect the room index; each room has its
+- There is no global lock. The `DashMap` shards protect the room index; each room has its
   own `tokio::sync::Mutex`. A `DashMap` guard is never held across an `.await`: handlers
   clone the `Arc<Room>` out and drop the guard immediately.
-* `member_count` mirrors `members.len()` so `GET /rooms` never takes a room lock.
-* When the last member leaves, the room is marked `closed` under its lock and removed
+- `member_count` mirrors `members.len()` so `GET /rooms` never takes a room lock.
+- When the last member leaves, the room is marked `closed` under its lock and removed
   from the index with `remove_if(Arc::ptr_eq)`. A join that raced with the deletion sees
   `closed == true` and is rejected with `room_not_found`.
 
@@ -117,23 +127,23 @@ flowchart TB
     end
 ```
 
-* Broadcasts use `try_send` while holding the room lock, so a slow socket can never stall
+- Broadcasts use `try_send` while holding the room lock, so a slow socket can never stall
   a room. If a member's queue is full the broadcaster cancels that member's `kick` token;
   the member's own task then performs the normal disconnect cleanup. Cleanup never runs
   re-entrantly inside another member's broadcast.
-* A connection that sends nothing but `Join` within 5 seconds is closed.
-* Heartbeat: a WebSocket Ping every 20 seconds; after two consecutive missed Pongs the
+- A connection that sends nothing but `Join` within 5 seconds is closed.
+- Heartbeat: a WebSocket Ping every 20 seconds; after two consecutive missed Pongs the
   socket is closed.
-* Disconnect cleanup: remove the member, broadcast `peer_left`, release the screen lock
+- Disconnect cleanup: remove the member, broadcast `peer_left`, release the screen lock
   (broadcasting `screen_stopped`) if the leaver was publishing, delete the room if empty.
 
 ### 3.3 Background tasks and signals
 
-| Trigger | Action |
-|---------|--------|
-| every 60 s | Evict rooms with no members whose `last_activity` is older than `CHATTERCRAB_ROOM_IDLE_TTL_SECS`. Prune rate-limiter state. |
-| `SIGHUP` | Re-read certificate and key, build a new rustls `ServerConfig`, swap it atomically. Existing TLS sessions are untouched. |
-| `SIGTERM` / Ctrl+C | Stop accepting, cancel the shutdown token (every socket gets a Close frame `1001`), wait at most 10 s, exit. |
+| Trigger            | Action                                                                                                                      |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------- |
+| every 60 s         | Evict rooms with no members whose `last_activity` is older than `CHATTERCRAB_ROOM_IDLE_TTL_SECS`. Prune rate-limiter state. |
+| `SIGHUP`           | Re-read certificate and key, build a new rustls `ServerConfig`, swap it atomically. Existing TLS sessions are untouched.    |
+| `SIGTERM` / Ctrl+C | Stop accepting, cancel the shutdown token (every socket gets a Close frame `1001`), wait at most 10 s, exit.                |
 
 The server is a single static musl binary. Logs are JSON lines on stdout, which journald
 captures with timestamps and the unit name.
@@ -177,14 +187,14 @@ flowchart LR
 
 Rules:
 
-* `update()` in the UI never blocks. Every action is a message to the Backend.
-* The UI never calls webrtc or cpal. It sends `UiCommand`s; the Backend forwards media
+- `update()` in the UI never blocks. Every action is a message to the Backend.
+- The UI never calls webrtc or cpal. It sends `UiCommand`s; the Backend forwards media
   related ones as `MediaCommand`s and receives `MediaEvent`s.
-* Every channel is bounded. Producers on real-time threads use `try_send`/`try_push` and
+- Every channel is bounded. Producers on real-time threads use `try_send`/`try_push` and
   drop on overflow (counted, logged at a rate limit) instead of blocking.
-* CPU-heavy codec work (Opus encode, H.264 encode/decode, decode/mix) runs on dedicated
+- CPU-heavy codec work (Opus encode, H.264 encode/decode, decode/mix) runs on dedicated
   OS threads, never on Tokio workers.
-* The real-time callbacks and the mixer loop do not allocate: all buffers are allocated
+- The real-time callbacks and the mixer loop do not allocate: all buffers are allocated
   when a stream or peer is set up. The cpal callbacks never lock a mutex.
 
 ## 5. Message flows
@@ -202,8 +212,8 @@ sequenceDiagram
     participant A as Client A
     participant B as Client B
 
-    C->>S: GET /turn-credentials
-    S-->>C: TurnCredentials
+    C->>S: GET /ice-servers
+    S-->>C: IceServers
     C->>S: WSS /ws/{room}
     C->>S: join {display_name}
     S-->>C: welcome {you, peers:[A,B], history, screen_publisher}
@@ -281,7 +291,7 @@ encoder thread
   -> accumulate 960-sample (20 ms) frames
   -> mute: frame replaced by zeros (Opus DTX makes it ~1 byte)
   -> RMS for the local speaking indicator     (atomic store)
-  -> Opus encode: VoIP, 32 kbps, DTX, in-band FEC, complexity 5
+  -> Opus encode: VoIP, 96 kbps, DTX, in-band FEC, complexity 5
   -> OpusFrame (fixed array + len) -> bounded channel (try_send)
 MediaEngine
   -> wrap the frame once in refcounted Bytes and write it to each connection's
@@ -312,43 +322,43 @@ The mixer measures each iteration; if one exceeds 20 ms it logs a rate-limited w
 ```text
 publisher: capture thread
   xcap (monitor or window) -> RGBA
-  -> fast_image_resize to fit 1280x720 (even dimensions)
-  -> RGB -> YUV 4:2:0 -> openh264 encode (baseline, ~1.5 Mbps, IDR every 2 s, IDR on PLI/FIR)
+  -> fast_image_resize to fit 2560x1440 (1440p) or 1920x1080 (1080p), never scaled up
+  -> hardware H.264 (Windows Media Foundation, Linux VA-API), otherwise OpenH264
   -> Annex-B access unit + duration -> bounded channel -> H.264 TrackLocalStaticSample
 receiver:
   on_track(video) -> RTP reader -> H.264 depacketizer -> access unit
   -> decoder thread (openh264) -> RGBA frame -> drop-oldest queue (capacity 2) -> UI image
 ```
 
-Frame rate defaults to 15 fps, configurable 5 to 30.
+Frame rate defaults to 60 fps with the 1440p cap. Other rates from 5 to 60 remain selectable, and high quality adds 120 fps. The share picker also asks for desktop mode (crisp fonts) or game mode (less blur on moving images). That choice does not change the resolution or frame rate. On Windows and Linux the picture is encoded by the GPU's H.264 encoder when one is registered. High quality uses H.264 High at the fixed bitrate on both.
 
 ### 6.4 Peer management and negotiation
 
 `PeerManager` owns one webrtc `PeerConnection` per remote peer, keyed by `PeerId`.
 
-* Perfect negotiation: the peer with the lexicographically smaller `PeerId` is
+- Perfect negotiation: the peer with the lexicographically smaller `PeerId` is
   **impolite**, the other is **polite**. On an incoming offer that collides with a local
   offer in flight, the impolite peer ignores it and the polite peer rolls back and
   answers. The decision logic lives in a pure state machine (`peer::negotiation`) that is
   unit tested against a fake signaling channel, separate from the webrtc plumbing.
-* Configuration: `MaxBundle`, `rtcp-mux` required, ICE servers from `TurnCredentials`,
+- Configuration: `MaxBundle`, `rtcp-mux` required, ICE servers from `IceServers` (one `stun:` URL, empty username and credential),
   disconnected timeout 5 s, failed timeout 15 s, UDP and TCP candidates only (IPv4 host
   candidates, no mDNS).
-* Tracks: audio is encoded once and the same buffer is written to one Opus local track
+- Tracks: audio is encoded once and the same buffer is written to one Opus local track
   per connection (webrtc 0.21 binds a local track to a single connection, ADR-201).
   While sharing, an H.264 track is added to every connection (renegotiation) and removed
   on stop; the H.264 stream is likewise encoded once.
-* webrtc 0.21 does not wake its connection driver when tracks or remote candidates
+- webrtc 0.21 does not wake its connection driver when tracks or remote candidates
   change, so the peer manager writes one Opus silence frame to nudge it (ADR-212);
   media is only sent to a peer once its connection is `Connected`.
 
 ## 7. Failure handling summary
 
-| Failure | Behavior |
-|---------|----------|
-| Slow signaling consumer | Queue (256) full: server kicks the member; others get `peer_left`. |
-| Client dead without TCP FIN | Two missed WS pongs (about 40 s) and the server cleans up. |
-| Signaling WS drops on client | Backoff reconnect, mesh rebuilt from the new `welcome`. |
-| ICE failure with one peer | The impolite side performs an ICE restart (up to 2 attempts, counter reset on `Connected`); the UI shows the peer's connection state. |
-| Audio device unplugged | Stream error event; UI shows it, user can reselect a device. |
-| Server restart | Clients reconnect; rooms are in-memory and must be recreated if empty. |
+| Failure                      | Behavior                                                                                                                              |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| Slow signaling consumer      | Queue (256) full: server kicks the member; others get `peer_left`.                                                                    |
+| Client dead without TCP FIN  | Two missed WS pongs (about 40 s) and the server cleans up.                                                                            |
+| Signaling WS drops on client | Backoff reconnect, mesh rebuilt from the new `welcome`.                                                                               |
+| ICE failure with one peer    | The impolite side performs an ICE restart (up to 2 attempts, counter reset on `Connected`); the UI shows the peer's connection state. |
+| Audio device unplugged       | Stream error event; UI shows it, user can reselect a device.                                                                          |
+| Server restart               | Clients reconnect; rooms are in-memory and must be recreated if empty.                                                                |

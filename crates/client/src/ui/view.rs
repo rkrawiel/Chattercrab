@@ -1,6 +1,7 @@
 //! View functions for the three screens. Plain widgets, no animations.
 
-use chattercrab_media::PeerConnectionState;
+use chattercrab_media::{PEER_VOLUME_MAX, PeerConnectionState, ScreenContent, ScreenScale};
+use iced::widget::image::FilterMethod;
 use iced::widget::{
     Column, button, checkbox, column, container, image, pick_list, row, scrollable, slider, space,
     text, text_input, toggler,
@@ -8,18 +9,31 @@ use iced::widget::{
 use iced::{Alignment, Background, Border, Color, ContentFit, Element, Length, Theme};
 
 use super::room_model::MemberView;
-use super::{App, Lobby, Message, RoomScreen, SYSTEM_DEFAULT, Screen, SharePicker};
+use super::{App, Lobby, Message, RoomScreen, SYSTEM_DEFAULT, Screen, SharePicker, selectable};
 use crate::config::ThemeChoice;
 
 const SPACING: u32 = 8;
 const PADDING: u16 = 12;
-const FPS_CHOICES: [u32; 5] = [5, 10, 15, 20, 30];
+const CONTENT_CHOICES: [ScreenContent; 2] = [ScreenContent::Desktop, ScreenContent::Game];
+const FPS_CHOICES: [u32; 6] = [5, 10, 15, 20, 30, 60];
+const FPS_CHOICES_HQ: [u32; 7] = [5, 10, 15, 20, 30, 60, 120];
+const SCALE_CHOICES: [ScreenScale; 4] = [
+    ScreenScale::P4K,
+    ScreenScale::P2K,
+    ScreenScale::P1440,
+    ScreenScale::P1080,
+];
 
 pub(super) fn view(app: &App) -> Element<'_, Message> {
     let body = match &app.state.screen {
         Screen::Connect { connecting } => connect_view(app, *connecting),
         Screen::Lobby(lobby) => lobby_view(lobby),
-        Screen::Room(room) => room_view(room, app.config.noise_suppression),
+        Screen::Room(room) => room_view(
+            room,
+            app.config.noise_suppression,
+            app.config.input_gain,
+            app.share_fullscreen,
+        ),
     };
     let mut page = Column::new().push(container(body).height(Length::Fill));
     if let Some(notice) = &app.state.notice {
@@ -71,8 +85,23 @@ fn connect_view(app: &App, connecting: bool) -> Element<'_, Message> {
         text("Chattercrab").size(28),
         labeled(
             "Server",
-            text_input("https://chat.example.com:8443", &config.server_url)
+            text_input("https://chattercrab.qcodefactory.com", &config.server_url)
                 .on_input(Message::ServerUrlChanged)
+                .on_submit(Message::Connect)
+                .into(),
+        ),
+        labeled(
+            "User",
+            text_input("Username", &config.auth_user)
+                .on_input(Message::AuthUserChanged)
+                .on_submit(Message::Connect)
+                .into(),
+        ),
+        labeled(
+            "Password",
+            text_input("Shared password", &config.password)
+                .secure(true)
+                .on_input(Message::PasswordChanged)
                 .on_submit(Message::Connect)
                 .into(),
         ),
@@ -89,6 +118,7 @@ fn connect_view(app: &App, connecting: bool) -> Element<'_, Message> {
                 .width(Length::Fill)
                 .into(),
         ),
+        labeled("Mic volume", mic_gain_control(config.input_gain)),
         labeled(
             "Speakers",
             pick_list(outputs, Some(selected_output), Message::OutputSelected)
@@ -115,6 +145,19 @@ fn connect_view(app: &App, connecting: bool) -> Element<'_, Message> {
     .max_width(480);
 
     container(form).center(Length::Fill).padding(PADDING).into()
+}
+
+fn mic_gain_control(gain: f32) -> Element<'static, Message> {
+    row![
+        slider(0.0..=5.0, gain, Message::InputGainChanged)
+            .step(0.05_f32)
+            .on_release(Message::InputGainReleased)
+            .width(Length::Fill),
+        text(format!("{:>3}%", (gain * 100.0).round() as u32)).size(14),
+    ]
+    .spacing(SPACING)
+    .align_y(Alignment::Center)
+    .into()
 }
 
 fn labeled<'a>(label: &'a str, field: Element<'a, Message>) -> Element<'a, Message> {
@@ -212,7 +255,7 @@ fn member_row(member: &MemberView) -> Element<'_, Message> {
         .spacing(SPACING)
         .align_y(Alignment::Center),
         row![
-            slider(0.0..=2.0, member.volume, move |v| {
+            slider(0.0..=PEER_VOLUME_MAX, member.volume, move |v| {
                 Message::PeerVolumeChanged(id, v)
             })
             .step(0.05_f32)
@@ -260,15 +303,13 @@ fn members_panel(room: &RoomScreen) -> Element<'_, Message> {
 
 fn chat_panel(room: &RoomScreen) -> Element<'_, Message> {
     let model = &room.model;
-    let mut log = Column::new().spacing(4);
+    let mut log = Column::new().spacing(4).width(Length::Fill);
     for msg in &model.chat {
-        log = log.push(
-            column![
-                text(msg.display_name.as_str()).size(12),
-                text(msg.text.as_str())
-            ]
-            .spacing(2),
-        );
+        log = log.push(selectable::message(
+            msg.id,
+            msg.display_name.as_str(),
+            msg.text.as_str(),
+        ));
     }
     let input = text_input("Message (Enter to send)", &room.chat_input)
         .on_input(Message::ChatChanged)
@@ -297,10 +338,27 @@ fn share_picker(picker: &SharePicker) -> Element<'_, Message> {
         .width(Length::Fill)
         .into()
     };
-    row![
+    let fps_choices: Vec<u32> = if picker.high_quality {
+        FPS_CHOICES_HQ.to_vec()
+    } else {
+        FPS_CHOICES.to_vec()
+    };
+    let controls = row![
         sources,
+        text("mode"),
+        pick_list(
+            CONTENT_CHOICES,
+            Some(picker.content),
+            Message::ShareContentSelected,
+        ),
         text("fps"),
-        pick_list(FPS_CHOICES, Some(picker.fps), Message::ShareFpsSelected),
+        pick_list(fps_choices, Some(picker.fps), Message::ShareFpsSelected),
+        text("size"),
+        pick_list(
+            SCALE_CHOICES,
+            Some(picker.scale),
+            Message::ShareScaleSelected,
+        ),
         button("Start sharing")
             .on_press_maybe(picker.selected.is_some().then_some(Message::StartShare)),
         button("Cancel")
@@ -308,11 +366,37 @@ fn share_picker(picker: &SharePicker) -> Element<'_, Message> {
             .on_press(Message::CancelShare),
     ]
     .spacing(SPACING)
-    .align_y(Alignment::Center)
-    .into()
+    .align_y(Alignment::Center);
+    let mut picker_column = column![
+        controls,
+        row![
+            checkbox(picker.high_quality)
+                .label("High quality")
+                .on_toggle(Message::ShareHighQualityToggled),
+            checkbox(picker.include_audio)
+                .label("Share audio from other apps (this call is not included)")
+                .on_toggle(Message::ShareAudioToggled),
+        ]
+        .spacing(SPACING)
+        .align_y(Alignment::Center),
+    ]
+    .spacing(SPACING);
+    let mode_hint = match picker.content {
+        ScreenContent::Desktop => {
+            "Crisp fonts and UI. Resolution and frame rate stay as you set them."
+        }
+        ScreenContent::Game => {
+            "Less blur on moving images. Resolution and frame rate stay as you set them."
+        }
+    };
+    picker_column = picker_column.push(text(mode_hint).size(14));
+    if picker.high_quality {
+        picker_column = picker_column.push(text("Higher bitrate and low delay.").size(14));
+    }
+    picker_column.into()
 }
 
-fn bottom_bar(room: &RoomScreen, noise_suppression: bool) -> Element<'_, Message> {
+fn bottom_bar(room: &RoomScreen, noise_suppression: bool, input_gain: f32) -> Element<'_, Message> {
     if let Some(picker) = &room.picker {
         return share_picker(picker);
     }
@@ -331,7 +415,7 @@ fn bottom_bar(room: &RoomScreen, noise_suppression: bool) -> Element<'_, Message
             button::secondary
         }
     };
-    row![
+    let controls = row![
         button(if model.muted { "Unmute" } else { "Mute" })
             .style(toggle_style(model.muted))
             .on_press(Message::ToggleMute),
@@ -348,12 +432,54 @@ fn bottom_bar(room: &RoomScreen, noise_suppression: bool) -> Element<'_, Message
             .on_press(Message::Leave),
     ]
     .spacing(SPACING)
-    .align_y(Alignment::Center)
+    .align_y(Alignment::Center);
+    column![
+        controls,
+        labeled("Mic volume", mic_gain_control(input_gain))
+    ]
+    .spacing(SPACING)
     .into()
 }
 
-fn room_view(room: &RoomScreen, noise_suppression: bool) -> Element<'_, Message> {
+fn share_stage(room: &RoomScreen) -> Element<'_, Message> {
+    match &room.frame {
+        Some(handle) => image(handle.clone())
+            .filter_method(FilterMethod::Nearest)
+            .content_fit(ContentFit::Contain)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into(),
+        None => container(text("Waiting for the first frame..."))
+            .center(Length::Fill)
+            .into(),
+    }
+}
+
+fn room_view(
+    room: &RoomScreen,
+    noise_suppression: bool,
+    input_gain: f32,
+    fullscreen: bool,
+) -> Element<'_, Message> {
     let model = &room.model;
+    if fullscreen && model.remote_share_active() {
+        return column![
+            container(share_stage(room))
+                .width(Length::Fill)
+                .height(Length::Fill),
+            row![
+                space().width(Length::Fill),
+                button("Exit fullscreen").on_press(Message::ExitShareFullscreen),
+            ]
+            .spacing(SPACING)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(SPACING)
+        .padding(PADDING)
+        .height(Length::Fill)
+        .into();
+    }
+
     let mut header = row![text(model.name.as_str()).size(22).width(Length::Fill)]
         .spacing(SPACING)
         .align_y(Alignment::Center);
@@ -367,20 +493,13 @@ fn room_view(room: &RoomScreen, noise_suppression: bool) -> Element<'_, Message>
         let who = model.name_of(publisher).unwrap_or("someone");
         header = header.push(text(format!("{who} is sharing")).size(14));
     }
+    if model.remote_share_active() {
+        header = header.push(button("Fullscreen").on_press(Message::ToggleShareFullscreen));
+    }
 
     let center: Element<'_, Message> = if model.remote_share_active() {
-        let stage: Element<'_, Message> = match &room.frame {
-            Some(handle) => image(handle.clone())
-                .content_fit(ContentFit::Contain)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into(),
-            None => container(text("Waiting for the first frame..."))
-                .center(Length::Fill)
-                .into(),
-        };
         row![
-            container(stage)
+            container(share_stage(room))
                 .width(Length::FillPortion(3))
                 .height(Length::Fill),
             container(chat_panel(room)).width(Length::Fixed(300.0)),
@@ -396,7 +515,7 @@ fn room_view(room: &RoomScreen, noise_suppression: bool) -> Element<'_, Message>
         row![members_panel(room), center]
             .spacing(SPACING)
             .height(Length::Fill),
-        bottom_bar(room, noise_suppression),
+        bottom_bar(room, noise_suppression, input_gain),
     ]
     .spacing(SPACING)
     .padding(PADDING)

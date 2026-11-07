@@ -28,8 +28,8 @@ use chattercrab_media::{
     PeerConnectionState,
 };
 use chattercrab_protocol::{
-    ClientMsg, CreateRoomRequest, DisplayName, ErrorCode, PeerId, RoomName, RoomSummary, ServerMsg,
-    TurnCredentials,
+    ClientMsg, CreateRoomRequest, DisplayName, ErrorCode, IceServers, PeerId, RoomName,
+    RoomSummary, ServerMsg,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
@@ -142,13 +142,16 @@ async fn main() -> anyhow::Result<()> {
         (None, None) => unreachable!("checked in parse_args"),
     };
 
-    let resp = http.get(format!("{base}/turn-credentials")).send().await?;
-    let ice: Option<TurnCredentials> = if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE
-    {
-        None
-    } else {
-        Some(resp.error_for_status()?.json().await?)
-    };
+    let ice: IceServers = http
+        .get(format!("{base}/ice-servers"))
+        .send()
+        .await
+        .context("fetching ICE servers")?
+        .error_for_status()
+        .context("ICE servers request failed")?
+        .json()
+        .await
+        .context("decoding ICE servers")?;
 
     let ws_base = if let Some(rest) = base.strip_prefix("https://") {
         format!("wss://{rest}")
@@ -166,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
         input_device: None,
         output_device: (!args.play).then(|| NO_OUTPUT_DEVICE.to_owned()),
         noise_suppression: false,
+        input_gain: 1.0,
     };
     let diagnostics = MediaDiagnostics {
         test_tone: Some(args.tone),
@@ -192,7 +196,7 @@ async fn main() -> anyhow::Result<()> {
                     Some(Err(e)) => bail!("websocket error: {e}"),
                 };
                 let msg: ServerMsg = serde_json::from_str(&text)?;
-                for cmd in on_server_msg(msg, ice.as_ref(), &mut report)? {
+                for cmd in on_server_msg(msg, Some(&ice), &mut report)? {
                     engine.commands.send(cmd).await?;
                 }
             }
@@ -253,7 +257,7 @@ async fn main() -> anyhow::Result<()> {
 /// Server message to media commands, as in the client's session logic.
 fn on_server_msg(
     msg: ServerMsg,
-    ice: Option<&TurnCredentials>,
+    ice: Option<&IceServers>,
     report: &mut Report,
 ) -> anyhow::Result<Vec<MediaCommand>> {
     Ok(match msg {

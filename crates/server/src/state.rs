@@ -34,11 +34,6 @@ pub fn now_millis() -> UnixMillis {
         .unwrap_or_default()
 }
 
-/// Current wall-clock time in Unix seconds.
-pub fn now_secs() -> u64 {
-    now_millis() / 1000
-}
-
 /// State shared by every request handler and connection task.
 pub struct AppState {
     /// Immutable configuration.
@@ -47,7 +42,7 @@ pub struct AppState {
     room_count: AtomicUsize,
     next_room_seq: AtomicU64,
     create_limiter: DefaultKeyedRateLimiter<IpAddr>,
-    turn_limiter: DefaultKeyedRateLimiter<IpAddr>,
+    ice_limiter: DefaultKeyedRateLimiter<IpAddr>,
     /// Cancelled when the server shuts down; parent of every member's kick token.
     pub shutdown: CancellationToken,
     /// Tracks upgraded WebSocket tasks so shutdown can wait for their close frames.
@@ -67,14 +62,14 @@ impl AppState {
     pub fn new(config: Config, shutdown: CancellationToken) -> Self {
         let create_quota =
             Quota::per_minute(config.create_room_per_minute).allow_burst(config.create_room_burst);
-        let turn_quota = Quota::per_minute(config.turn_per_minute);
+        let ice_quota = Quota::per_minute(config.ice_per_minute);
         Self {
             config,
             rooms: DashMap::new(),
             room_count: AtomicUsize::new(0),
             next_room_seq: AtomicU64::new(0),
             create_limiter: RateLimiter::keyed(create_quota),
-            turn_limiter: RateLimiter::keyed(turn_quota),
+            ice_limiter: RateLimiter::keyed(ice_quota),
             shutdown,
             tracker: TaskTracker::new(),
         }
@@ -85,9 +80,9 @@ impl AppState {
         self.create_limiter.check_key(&ip).is_ok()
     }
 
-    /// Returns true if `ip` may fetch TURN credentials now.
-    pub fn allow_turn_credentials(&self, ip: IpAddr) -> bool {
-        self.turn_limiter.check_key(&ip).is_ok()
+    /// Returns true if `ip` may fetch ICE servers now.
+    pub fn allow_ice_servers(&self, ip: IpAddr) -> bool {
+        self.ice_limiter.check_key(&ip).is_ok()
     }
 
     /// Creates a room with a fresh random id.
@@ -180,7 +175,7 @@ impl AppState {
             }
         }
         self.create_limiter.retain_recent();
-        self.turn_limiter.retain_recent();
+        self.ice_limiter.retain_recent();
         evicted
     }
 }

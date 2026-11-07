@@ -1,8 +1,9 @@
 //! Audio capture, encoding and playback.
 //!
 //! * [`AudioInput`]: cpal input stream, mono downmix in the callback, lock-free SPSC
-//!   ring to a dedicated encoder thread that resamples to 48 kHz, cuts 20 ms frames and
-//!   encodes them with Opus (VoIP, 32 kbps, DTX, in-band FEC, complexity 5).
+//!   ring to a dedicated encoder thread that resamples to 48 kHz, applies microphone
+//!   gain, optionally mixes system audio, cuts 20 ms frames and encodes them with Opus
+//!   (VoIP, 96 kbps, DTX, in-band FEC, complexity 5).
 //! * [`AudioOutput`]: cpal output stream fed from an SPSC ring of mono `f32` samples at
 //!   the device rate; the matching [`OutputSink`] is handed to the mixer thread.
 //! * Device enumeration and lookup by name.
@@ -12,9 +13,13 @@
 mod capture;
 mod playback;
 pub mod resample;
+mod share;
+mod system;
 
 pub use capture::{AudioInput, CaptureStats};
 pub use playback::{AudioOutput, OutputSink};
+pub use share::ShareMix;
+pub(crate) use system::SystemCapture;
 
 use cpal::traits::{DeviceTrait, HostTrait};
 
@@ -27,7 +32,7 @@ pub const FRAME_SAMPLES: usize = 960;
 /// Largest Opus packet (RFC 6716).
 pub const MAX_OPUS_PACKET: usize = crate::jitter::MAX_PACKET;
 /// Target Opus bitrate.
-pub const OPUS_BITRATE: i32 = 32_000;
+pub const OPUS_BITRATE: i32 = 96_000;
 /// Capacity of the encoded frame channel (16 x 20 ms = 320 ms).
 pub const FRAME_CHANNEL_CAPACITY: usize = 16;
 
@@ -127,6 +132,36 @@ pub(crate) fn find_output_device(name: Option<&str>) -> Result<cpal::Device, Med
     }
 }
 
+/// Lowest microphone gain. `0.0` replaces the microphone with silence.
+pub const INPUT_GAIN_MIN: f32 = 0.0;
+/// Highest microphone gain. `5.0` is 500% of the captured level.
+pub const INPUT_GAIN_MAX: f32 = 5.0;
+
+/// Clamps a microphone gain into [`INPUT_GAIN_MIN`]..=[`INPUT_GAIN_MAX`].
+///
+/// Non-finite values become `1.0` (unity, the captured level unchanged).
+pub fn clamp_input_gain(gain: f32) -> f32 {
+    if gain.is_finite() {
+        gain.clamp(INPUT_GAIN_MIN, INPUT_GAIN_MAX)
+    } else {
+        1.0
+    }
+}
+
+/// Multiplies `samples` by `gain` and hard-limits each sample to [-1, 1].
+///
+/// A gain of `1.0` leaves the samples untouched, so the default path does not
+/// change existing audio.
+pub fn apply_input_gain(samples: &mut [f32], gain: f32) {
+    let gain = clamp_input_gain(gain);
+    if (gain - 1.0).abs() <= f32::EPSILON {
+        return;
+    }
+    for sample in samples {
+        *sample = (*sample * gain).clamp(-1.0, 1.0);
+    }
+}
+
 /// Root-mean-square level of an `f32` frame, 0.0..=1.0.
 pub fn rms_f32(samples: &[f32]) -> f32 {
     if samples.is_empty() {
@@ -177,6 +212,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn opus_bitrate_is_96_kbps() {
+        assert_eq!(OPUS_BITRATE, 96_000);
+        let mut enc = new_opus_encoder().unwrap();
+        assert_eq!(enc.get_bitrate().unwrap(), opus::Bitrate::Bits(96_000));
+    }
+
+    #[test]
     fn opus_roundtrip_with_fec_and_plc() {
         let mut enc = new_opus_encoder().unwrap();
         let mut dec = new_opus_decoder().unwrap();
@@ -214,6 +256,20 @@ mod tests {
             last = enc.encode_float(&zeros, &mut out).unwrap();
         }
         assert!(last <= 3, "silent frame was {last} bytes");
+    }
+
+    #[test]
+    fn input_gain_is_unity_until_it_clips() {
+        let mut samples = [0.2, -0.4, 0.5];
+        apply_input_gain(&mut samples, 1.0);
+        assert_eq!(samples, [0.2, -0.4, 0.5]);
+        apply_input_gain(&mut samples, 5.0);
+        assert!((samples[0] - 1.0).abs() < 1e-6);
+        assert!((samples[1] + 1.0).abs() < 1e-6);
+        assert!((samples[2] - 1.0).abs() < 1e-6);
+        assert_eq!(clamp_input_gain(f32::NAN), 1.0);
+        assert_eq!(clamp_input_gain(9.0), INPUT_GAIN_MAX);
+        assert_eq!(clamp_input_gain(-1.0), INPUT_GAIN_MIN);
     }
 
     #[test]

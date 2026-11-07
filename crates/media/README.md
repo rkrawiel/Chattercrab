@@ -56,7 +56,7 @@ explanation instead of hanging.
 | Metric | Result |
 |--------|--------|
 | Mixer iteration, 1 peer, including 48 → 96 kHz resampling | max 0.33 ms (budget 20 ms), 0 overruns in 10 s |
-| Encoded bitrate, voiced synthetic signal | 30.5 kbit/s (target 32) |
+| Encoded bitrate, voiced synthetic signal | 30.5 kbit/s (measured at the previous 32 kbps target; configured target is now 96 kbps) |
 | Output underruns during 10 s | 0 |
 | Denoiser cost | about 80 µs per 20 ms frame (measured by the denoise module, release) |
 | Capture-to-encode latency | not measured here: the test machine's microphone delivered no capture callbacks (also with plain cpal). The encoder records it per frame (`CaptureStats::last_latency_us` / `max_latency_us`) as the time since the last capture callback plus audio still queued; expected 10 to 22 ms with 10 ms device buffers. Run the loopback example on a machine with a working microphone to report it. |

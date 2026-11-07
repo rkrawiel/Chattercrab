@@ -11,7 +11,8 @@
 #                 because building on /mnt/<drive> is slow.
 #
 # Steps: fmt, clippy, tests, release build of the workspace, deploy/build-release.sh,
-# ShellCheck, systemd-analyze verify, and an idle RSS measurement of the musl server.
+# ShellCheck of the remaining deploy shell scripts, and an idle RSS measurement of
+# the musl server.
 # Exits non-zero on the first failing step.
 set -euo pipefail
 
@@ -21,7 +22,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --setup) SETUP=1 ;;
         -h | --help)
-            sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *) SOURCE="$1" ;;
@@ -95,22 +96,6 @@ bash deploy/build-release.sh
 
 step "shellcheck"
 shellcheck -S style deploy/*.sh
-
-step "systemd-analyze verify"
-if command -v systemd-analyze >/dev/null 2>&1; then
-    tmp_unit_dir="$(mktemp -d)"
-    install -m 0644 deploy/chattercrab-signal.service "$tmp_unit_dir/"
-    if [[ -x /opt/chattercrab/bin/chattercrab-signal ]] && id chattercrab >/dev/null 2>&1; then
-        systemd-analyze verify "$tmp_unit_dir/chattercrab-signal.service"
-        echo "systemd-analyze verify: clean"
-    else
-        echo "skipped: needs /opt/chattercrab/bin/chattercrab-signal and the chattercrab user"
-        echo "(run deploy/install.sh --skip-firewall --no-start first)"
-    fi
-    rm -rf "$tmp_unit_dir"
-else
-    echo "skipped: systemd-analyze not available"
-fi
 
 step "idle RSS of the musl server"
 SERVER=dist/server/chattercrab-signal

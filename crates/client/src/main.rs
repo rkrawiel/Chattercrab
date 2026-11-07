@@ -71,6 +71,9 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> anyhow::Result<Cli> {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Release builds are GUI programs, so a terminal that launched us does not
+    // receive stdout or stderr until we attach to it.
+    attach_parent_console();
     let args = match parse_args(std::env::args().skip(1))? {
         Cli::Run(args) => args,
         Cli::Help => {
@@ -160,6 +163,59 @@ fn main() -> anyhow::Result<()> {
     }
     result.context("running the UI")
 }
+
+/// Connects a release build to the console that started it, so logs are visible
+/// in that terminal. A double-clicked window has no parent console and is left alone.
+#[cfg(all(windows, not(debug_assertions)))]
+fn attach_parent_console() {
+    use std::ffi::c_void;
+
+    unsafe extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+        fn SetStdHandle(std_handle: u32, handle: *mut c_void) -> i32;
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            security: *mut c_void,
+            disposition: u32,
+            flags: u32,
+            template: *mut c_void,
+        ) -> *mut c_void;
+    }
+
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    const STD_OUTPUT_HANDLE: u32 = u32::MAX - 10;
+    const STD_ERROR_HANDLE: u32 = u32::MAX - 11;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_READ: u32 = 1;
+    const FILE_SHARE_WRITE: u32 = 2;
+    const OPEN_EXISTING: u32 = 3;
+
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return;
+        }
+        let name: Vec<u16> = "CONOUT$\0".encode_utf16().collect();
+        let handle = CreateFileW(
+            name.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        );
+        if handle.is_null() || handle == usize::MAX as *mut c_void {
+            return;
+        }
+        SetStdHandle(STD_OUTPUT_HANDLE, handle);
+        SetStdHandle(STD_ERROR_HANDLE, handle);
+    }
+}
+
+#[cfg(not(all(windows, not(debug_assertions))))]
+fn attach_parent_console() {}
 
 #[cfg(test)]
 mod tests {

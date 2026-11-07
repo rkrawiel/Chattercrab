@@ -25,3 +25,6 @@ rustc-ice-*.txt
 
 # Chattercrab build outputs
 /dist/
+
+# Local Compose secrets. .env.example is the tracked template.
+.env

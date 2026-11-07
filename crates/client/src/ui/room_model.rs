@@ -21,7 +21,7 @@ pub struct MemberView {
     pub info: PeerInfo,
     /// Last reported audio level.
     pub level: f32,
-    /// Playback volume (0.0 to 2.0), kept while locally muted.
+    /// Playback volume (0.0 to 5.0), kept while locally muted.
     pub volume: f32,
     /// Locally muted (volume 0 sent to the media engine).
     pub muted: bool,

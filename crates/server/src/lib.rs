@@ -1,17 +1,18 @@
 //! Chattercrab signaling server.
 //!
 //! Hosts rooms, relays SDP offers/answers and ICE candidates between members,
-//! keeps a short in-memory chat history, arbitrates the single screen-share slot per
-//! room and issues TURN REST credentials. It never relays media.
+//! keeps a short in-memory chat history, and arbitrates the single screen-share slot per
+//! room. It never relays media. Clients learn the configured STUN URL from `GET /ice-servers`.
+//! When `CHATTERCRAB_PASSWORD` is set, every route except `GET /health` requires HTTP Basic auth.
 //!
 //! The binary `chattercrab-signal` is a thin wrapper around [`run`]; integration tests
 //! call [`run`] directly with an ephemeral listener.
 
+mod auth;
 pub mod config;
 pub mod http;
 pub mod state;
 pub mod tls;
-pub mod turn;
 pub mod ws;
 
 use std::net::SocketAddr;
@@ -58,9 +59,7 @@ pub async fn run(
     let local_addr = listener.local_addr()?;
     let tls = config.tls.clone();
     let grace = config.shutdown_grace;
-    if config.turn.is_none() {
-        tracing::warn!("TURN is not configured; /turn-credentials will answer 503");
-    }
+    tracing::info!(stun_url = %config.stun_url, "STUN server");
     let state = Arc::new(AppState::new(config, signals.shutdown.clone()));
     let app = http::router(Arc::clone(&state)).into_make_service_with_connect_info::<SocketAddr>();
 

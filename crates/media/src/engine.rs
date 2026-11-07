@@ -18,7 +18,8 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 
-use crate::audio::{AudioInput, AudioOutput, OpusFrame};
+use crate::audio::{AudioInput, AudioOutput, OpusFrame, ShareMix, SystemCapture};
+use crate::clamp_input_gain;
 use crate::mixer::{MixerControl, MixerHandle, PeerAudioControls, PeerSlot, RtpAudioPacket};
 use crate::peer::{InternalEvent, PeerEvent, PeerManager, PeerSettings, SendTargets};
 use crate::screen::{EncodedVideo, ScreenPublisher};
@@ -45,6 +46,11 @@ struct Engine {
 
     muted: Arc<AtomicBool>,
     denoise: Arc<AtomicBool>,
+    /// Microphone gain as `f32` bits.
+    gain: Arc<AtomicU32>,
+    /// System audio mixed into the outgoing voice while a share includes it.
+    share: Arc<ShareMix>,
+    system_audio: Option<SystemCapture>,
     local_level: Arc<AtomicU32>,
     input_device: Option<String>,
     output_device: Option<String>,
@@ -87,6 +93,11 @@ pub(crate) async fn run(
         notes_tx,
         muted: Arc::new(AtomicBool::new(false)),
         denoise: Arc::new(AtomicBool::new(config.noise_suppression)),
+        gain: Arc::new(AtomicU32::new(
+            clamp_input_gain(config.input_gain).to_bits(),
+        )),
+        share: ShareMix::new(),
+        system_audio: None,
         local_level: Arc::new(AtomicU32::new(0)),
         input_device: config.input_device,
         output_device: config.output_device,
@@ -143,11 +154,13 @@ impl Engine {
         let device = self.input_device.clone();
         let muted = self.muted.clone();
         let denoise = self.denoise.clone();
+        let gain = self.gain.clone();
+        let share = self.share.clone();
         let level = self.local_level.clone();
         let tone = self.test_tone;
         let opened = tokio::task::spawn_blocking(move || match tone {
-            Some(hz) => AudioInput::start_tone(hz, muted, denoise, level),
-            None => AudioInput::start(device.as_deref(), muted, denoise, level),
+            Some(hz) => AudioInput::start_tone(hz, muted, denoise, gain, share, level),
+            None => AudioInput::start(device.as_deref(), muted, denoise, gain, share, level),
         })
         .await;
         match opened {
@@ -225,6 +238,10 @@ impl Engine {
             MediaCommand::SetMuted(m) => self.muted.store(m, Ordering::Relaxed),
             MediaCommand::SetDeafened(d) => self.mixer.deafened.store(d, Ordering::Relaxed),
             MediaCommand::SetNoiseSuppression(on) => self.denoise.store(on, Ordering::Relaxed),
+            MediaCommand::SetInputGain(gain) => {
+                self.gain
+                    .store(clamp_input_gain(gain).to_bits(), Ordering::Relaxed);
+            }
             MediaCommand::SetPeerVolume { peer, volume } => {
                 self.volumes.insert(peer, volume);
                 if let Some(c) = self.peer_audio.get(&peer) {
@@ -239,7 +256,17 @@ impl Engine {
                 self.output_device = name;
                 self.open_output().await;
             }
-            MediaCommand::StartScreenShare { source, fps } => self.start_screen(source, fps).await,
+            MediaCommand::StartScreenShare {
+                source,
+                fps,
+                scale,
+                include_audio,
+                high_quality,
+                content,
+            } => {
+                self.start_screen(source, fps, scale, include_audio, high_quality, content)
+                    .await;
+            }
             MediaCommand::StopScreenShare => self.stop_screen().await,
             // Handled by the run loop.
             MediaCommand::Shutdown => {}
@@ -320,20 +347,49 @@ impl Engine {
         self.peers.remove_peer(peer).await;
     }
 
-    async fn start_screen(&mut self, source: crate::ScreenSource, fps: u32) {
+    async fn start_system_audio(&mut self) {
+        self.stop_system_audio().await;
+        let mix = self.share.clone();
+        match tokio::task::spawn_blocking(move || SystemCapture::start(mix)).await {
+            Ok(Ok(capture)) => self.system_audio = Some(capture),
+            Ok(Err(e)) => self.error(format!("screen audio unavailable: {e}")).await,
+            Err(e) => self.error(format!("screen audio task failed: {e}")).await,
+        }
+    }
+
+    async fn stop_system_audio(&mut self) {
+        if let Some(capture) = self.system_audio.take() {
+            let _ = tokio::task::spawn_blocking(move || drop(capture)).await;
+        }
+    }
+
+    async fn start_screen(
+        &mut self,
+        source: crate::ScreenSource,
+        fps: u32,
+        scale: crate::ScreenScale,
+        include_audio: bool,
+        high_quality: bool,
+        content: crate::ScreenContent,
+    ) {
         if self.screen.is_some() {
             self.stop_screen().await;
         }
+        if include_audio {
+            self.start_system_audio().await;
+        }
+        let fps = crate::screen::clamp_fps(fps, high_quality);
         let keyframe = self.peers.keyframe_flag();
-        let started =
-            tokio::task::spawn_blocking(move || ScreenPublisher::start(&source, fps, keyframe))
-                .await;
+        let started = tokio::task::spawn_blocking(move || {
+            ScreenPublisher::start(&source, fps, scale, keyframe, high_quality, content)
+        })
+        .await;
         match started {
             Ok(Ok(mut publisher)) => {
                 let (_, dummy) = mpsc::channel(1);
                 let frames = std::mem::replace(&mut publisher.frames, dummy);
                 self.screen = Some(publisher);
-                self.peers.set_screen_active(true).await;
+                self.peers.set_screen_active(true, high_quality, fps).await;
                 let notes = self.notes_tx.clone();
                 let targets = self.peers.video_targets();
                 self.video_pump = Some(tokio::spawn(async move {
@@ -343,10 +399,12 @@ impl Engine {
                 self.emit(MediaEvent::LocalScreenStarted).await;
             }
             Ok(Err(e)) => {
+                self.stop_system_audio().await;
                 self.error(format!("screen share failed: {e}")).await;
                 self.emit(MediaEvent::LocalScreenStopped).await;
             }
             Err(e) => {
+                self.stop_system_audio().await;
                 self.error(format!("screen share task failed: {e}")).await;
                 self.emit(MediaEvent::LocalScreenStopped).await;
             }
@@ -354,12 +412,13 @@ impl Engine {
     }
 
     async fn stop_screen(&mut self) {
+        self.stop_system_audio().await;
         if let Some(pump) = self.video_pump.take() {
             pump.abort();
         }
         if let Some(publisher) = self.screen.take() {
             let _ = tokio::task::spawn_blocking(move || drop(publisher)).await;
-            self.peers.set_screen_active(false).await;
+            self.peers.set_screen_active(false, false, 0).await;
             self.emit(MediaEvent::LocalScreenStopped).await;
         }
     }

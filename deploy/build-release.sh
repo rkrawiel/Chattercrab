@@ -175,12 +175,7 @@ build chattercrab-server chattercrab-signal "$SERVER_TARGET"
 SERVER_BIN="$ROOT_DIR/target/$SERVER_TARGET/release/chattercrab-signal"
 check_static "$SERVER_BIN"
 cp "$SERVER_BIN" "$DIST_DIR/server/"
-# Ship the deploy assets next to the server so install.sh finds everything.
-for f in install.sh firewall.sh certbot-deploy-hook.sh chattercrab-signal.service \
-    chattercrab.env.example turnserver.conf coturn-override.conf; do
-    cp "$SCRIPT_DIR/$f" "$DIST_DIR/server/"
-done
-chmod 0755 "$DIST_DIR/server/"*.sh "$DIST_DIR/server/chattercrab-signal"
+chmod 0755 "$DIST_DIR/server/chattercrab-signal"
 
 if ((BUILD_LINUX_CLIENT)); then
     build chattercrab-client chattercrab "$LINUX_TARGET"

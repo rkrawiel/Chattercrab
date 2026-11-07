@@ -33,16 +33,10 @@ pub struct CreateRoomRequest {
     pub name: RoomName,
 }
 
-/// Body of `GET /turn-credentials` (TURN REST API, time-limited).
+/// Body of `GET /ice-servers`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TurnCredentials {
-    /// `"{expiry_unix}:{random}"`.
-    pub username: String,
-    /// `base64(HMAC-SHA1(secret, username))`.
-    pub credential: String,
-    /// Lifetime of the credential in seconds.
-    pub ttl_secs: u64,
-    /// ICE server URLs (`stun:`, `turn:`, `turns:`).
+pub struct IceServers {
+    /// ICE server URLs. Chattercrab sends exactly one `stun:` URL and no TURN URLs.
     pub urls: Vec<String>,
 }
 
@@ -83,11 +77,8 @@ mod tests {
         roundtrip(&CreateRoomRequest {
             name: RoomName::new("standup").unwrap(),
         });
-        roundtrip(&TurnCredentials {
-            username: "1793918400:9f2c4e7a1b3d5f60".into(),
-            credential: "q1Z7m9B4c2v0kX8yT5rW3uN6pQs=".into(),
-            ttl_secs: 43_200,
-            urls: vec!["turn:chat.example.com:3478?transport=udp".into()],
+        roundtrip(&IceServers {
+            urls: vec!["stun:stun.l.google.com:19302".into()],
         });
         roundtrip(&ApiError {
             code: ErrorCode::RoomFull,

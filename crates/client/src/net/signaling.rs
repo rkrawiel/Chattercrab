@@ -4,10 +4,14 @@ use chattercrab_protocol::{ClientMsg, DisplayName, MAX_WS_MESSAGE_BYTES, ServerM
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::header::{AUTHORIZATION, HeaderValue};
 use tokio_tungstenite::tungstenite::protocol::{
     CloseFrame, WebSocketConfig, frame::coding::CloseCode,
 };
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
+
+use super::rest::basic_authorization_value;
 
 /// Capacity of the outgoing message queue of one connection.
 pub const OUTGOING_CAPACITY: usize = 256;
@@ -71,11 +75,22 @@ pub fn spawn(
     generation: u64,
     url: String,
     display_name: DisplayName,
+    auth_user: String,
+    password: String,
     events: mpsc::Sender<SignalEvent>,
 ) -> SignalHandle {
     let (tx, rx) = mpsc::channel(OUTGOING_CAPACITY);
     let task = tokio::spawn(async move {
-        let reason = run(generation, &url, display_name, rx, &events).await;
+        let reason = run(
+            generation,
+            &url,
+            display_name,
+            &auth_user,
+            &password,
+            rx,
+            &events,
+        )
+        .await;
         if let Some(reason) = reason {
             let _ = events
                 .send(SignalEvent::Closed { generation, reason })
@@ -90,15 +105,24 @@ async fn run(
     generation: u64,
     url: &str,
     display_name: DisplayName,
+    auth_user: &str,
+    password: &str,
     mut outgoing: mpsc::Receiver<ClientMsg>,
     events: &mpsc::Sender<SignalEvent>,
 ) -> Option<CloseReason> {
     let mut config = WebSocketConfig::default();
     config.max_message_size = Some(MAX_WS_MESSAGE_BYTES);
     config.max_frame_size = Some(MAX_WS_MESSAGE_BYTES);
-    let connect = tokio_tungstenite::connect_async_with_config(url, Some(config), false);
+    let request = match client_request(url, auth_user, password) {
+        Ok(request) => request,
+        Err(reason) => return Some(reason),
+    };
+    let connect = tokio_tungstenite::connect_async_with_config(request, Some(config), false);
     let (ws, _response) = match connect.await {
         Ok(ok) => ok,
+        Err(WsError::Http(resp)) if resp.status().as_u16() == 401 => {
+            return Some(CloseReason::Failed("authentication failed".to_owned()));
+        }
         Err(WsError::Http(resp)) if resp.status().as_u16() == 404 => {
             return Some(CloseReason::RoomNotFound);
         }
@@ -152,6 +176,24 @@ async fn run(
             },
         }
     }
+}
+
+fn client_request(
+    url: &str,
+    auth_user: &str,
+    password: &str,
+) -> Result<tokio_tungstenite::tungstenite::http::Request<()>, CloseReason> {
+    let mut request = url
+        .into_client_request()
+        .map_err(|e| CloseReason::Failed(format!("connect failed: {e}")))?;
+    if !password.is_empty() {
+        let value = basic_authorization_value(auth_user, password);
+        let header = HeaderValue::from_str(&value).map_err(|_| {
+            CloseReason::Failed("connect failed: invalid authorization header".to_owned())
+        })?;
+        request.headers_mut().insert(AUTHORIZATION, header);
+    }
+    Ok(request)
 }
 
 async fn send<S>(sink: &mut S, msg: &ClientMsg) -> Result<(), String>

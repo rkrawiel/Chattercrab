@@ -2,23 +2,24 @@
 
 A minimalist peer-to-peer voice, text and screen-share application, written entirely in
 Rust. Rooms hold up to 5 people connected in a full WebRTC mesh; a small signaling server
-coordinates rooms and relays chat, but never touches audio or video. Deployment is a
-single static binary plus Coturn on a bare Linux VPS, managed by systemd. No Docker, no
-JavaScript, no webviews.
+coordinates rooms and relays chat, but never touches audio or video. The server is still
+a Rust binary. The VPS deploy is Docker Compose with Traefik. Media is direct WebRTC
+with an external STUN URL, and there is no TURN relay. A shared password, set in the
+server environment and the client config, can gate signaling. No JavaScript, no webviews.
 
-* Voice: Opus 32 kbps with DTX and in-band FEC, adaptive jitter buffer, real-time mixer,
+- Voice: Opus 96 kbps with DTX and in-band FEC, adaptive jitter buffer, real-time mixer,
   per-peer volume, mute and deafen, optional RNNoise noise suppression.
-* Text: room chat with the last 200 messages kept in server memory only.
-* Screen share: one publisher per room (server-enforced), H.264 up to 1280x720.
-* Clients: Windows 10+ and Linux (X11).
+- Text: room chat with the last 200 messages kept in server memory only.
+- Screen share: one publisher per room (server-enforced), hardware H.264 at 1440p 60 fps, or 1080p 30 fps.
+- Clients: Windows 10+ and Linux (X11).
 
-| Document | Contents |
-|----------|----------|
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Components, threading model, message flows, media pipeline |
-| [docs/PROTOCOL.md](docs/PROTOCOL.md) | Every REST endpoint and WebSocket message with JSON examples |
-| [docs/DEPLOY.md](docs/DEPLOY.md) | VPS setup: DNS, TLS, Coturn, firewall, upgrades, troubleshooting |
-| [docs/DECISIONS.md](docs/DECISIONS.md) | Decision log (ADR style) |
-| [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md) | Requirement-by-requirement evidence |
+| Document                                     | Contents                                                     |
+| -------------------------------------------- | ------------------------------------------------------------ |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Components, threading model, message flows, media pipeline   |
+| [docs/PROTOCOL.md](docs/PROTOCOL.md)         | Every REST endpoint and WebSocket message with JSON examples |
+| [docs/DEPLOY.md](docs/DEPLOY.md)             | VPS setup: Docker Compose, Traefik, DNS, firewall, upgrades  |
+| [docs/DECISIONS.md](docs/DECISIONS.md)       | Decision log (ADR style)                                     |
+| [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md)     | Requirement-by-requirement evidence                          |
 
 ## Quick start (local, no TLS, no TURN)
 
@@ -37,7 +38,7 @@ crates/protocol   chattercrab-protocol   shared wire types, no I/O
 crates/server     chattercrab-server     binary chattercrab-signal
 crates/media      chattercrab-media      audio, video, WebRTC peer management
 crates/client     chattercrab-client     binary chattercrab (iced desktop app)
-deploy/           build, install, systemd, Coturn, firewall, certbot hook
+deploy/           release build and Linux verification scripts
 docs/             architecture, protocol, deployment, decisions, acceptance
 ```
 
@@ -45,7 +46,7 @@ docs/             architecture, protocol, deployment, decisions, acceptance
 
 Serde types shared by the client and server: validated newtypes (`RoomId`, `PeerId`
 (UUID v4), `DisplayName` (1 to 32 characters), `RoomName`), REST bodies (`RoomSummary`,
-`CreateRoomRequest`, `TurnCredentials`, `ApiError`) and the WebSocket enums `ClientMsg` and
+`CreateRoomRequest`, `IceServers`, `ApiError`) and the WebSocket enums `ClientMsg` and
 `ServerMsg`, tagged with `"t"` in snake_case. No I/O; every variant has a JSON round-trip
 test. Specification: [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
@@ -54,7 +55,7 @@ test. Specification: [docs/PROTOCOL.md](docs/PROTOCOL.md).
 The signaling server `chattercrab-signal`: axum over rustls (ring), per-room locks in a
 `DashMap`, bounded per-connection queues with slow-consumer eviction, WebSocket heartbeat,
 5 second join timeout, screen-share arbitration, chat history, idle-room sweeper, per-IP
-rate limits, TURN REST credentials (HMAC-SHA1), TLS reload on `SIGHUP` and graceful
+rate limits, one configured STUN URL via `GET /ice-servers`, TLS reload on `SIGHUP` and graceful
 shutdown on `SIGTERM`. Configured entirely through `CHATTERCRAB_*` environment variables.
 Builds as a fully static musl binary (about 3.9 MB) with about 3 MB idle RSS.
 Details: [crates/server/README.md](crates/server/README.md).
@@ -92,11 +93,11 @@ cargo fmt --check
 cargo deny check
 ```
 
-* **Linux (Debian/Ubuntu)**: see the apt package list in
-  [docs/DEPLOY.md section 13](docs/DEPLOY.md#13-building-on-linux-client-prerequisites).
-* **Windows**: Visual Studio Build Tools (C++ workload and Windows SDK). CMake can come
+- **Linux (Debian/Ubuntu)**: see the apt package list in
+  [docs/DEPLOY.md section 12](docs/DEPLOY.md#12-building-on-linux-client-prerequisites).
+- **Windows**: Visual Studio Build Tools (C++ workload and Windows SDK). CMake can come
   from `pip install --user cmake`.
-* **Release artifacts**: `deploy/build-release.sh` cross-compiles the static musl server
+- **Release artifacts**: `deploy/build-release.sh` cross-compiles the static musl server
   and the Linux and Windows clients into `dist/` with `cargo zigbuild` and writes
   `dist/SHA256SUMS`.
 

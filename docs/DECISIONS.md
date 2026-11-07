@@ -51,6 +51,8 @@ server, media engine, client, deployment and noise suppression.
 * Decision: for every `turn:` URL with UDP transport, the server adds `stun:host:port`.
 * Consequences: peers behind ordinary NAT connect directly instead of always relaying.
 
+Superseded by ADR-504.
+
 ## ADR-007: Native build tooling on the Windows development host
 
 * Context: the development machine is Windows with MSVC. `opus` 0.4 builds libopus via
@@ -376,6 +378,7 @@ server, media engine, client, deployment and noise suppression.
   or still the placeholder. The secret is always copied from env into Coturn, so an
   operator-chosen secret also propagates.
 * Consequences: rerunning the installer after editing the env file resyncs Coturn.
+  Superseded for deployment by ADR-506.
 
 ### ADR-402: NAT detection
 
@@ -529,3 +532,27 @@ server, media engine, client, deployment and noise suppression.
   behind the same `Denoiser` interface. The interface (one 20 ms, 48 kHz frame in
   place, plus `reset`) is deliberately engine-agnostic so that swap would not touch
   the encoder thread or the client.
+
+### ADR-503: Microphone Opus bitrate is 96 kbps
+
+Context: voice was encoded at 32 kbps (ADR-206). The operator wants higher mic quality.
+Decision: `OPUS_BITRATE` is 96_000. Application stays VoIP, mono 48 kHz, 20 ms, DTX, in-band FEC, complexity 5.
+Consequences: each upstream audio stream is about 96 kbps. A full mesh of N peers costs `(N - 1) x 96 kbps` upstream for audio. Screen share is unchanged. ADR-206 remains the historical record of the original settings; this ADR supersedes only the bitrate.
+
+### ADR-504: External STUN URL, no TURN
+
+Context: ADR-006 derived `stun:` URLs from the operator's Coturn `turn:` URLs and the server minted TURN REST credentials. The operator does not want a TURN relay.
+Decision: `CHATTERCRAB_STUN_URL` (default `stun:stun.l.google.com:19302`) is the only ICE server. `GET /ice-servers` returns `{ "urls": [that url] }`. `turn:` and `turns:` URLs are rejected. TURN REST, HMAC-SHA1 credentials, and `ErrorCode::TurnUnavailable` are removed.
+Consequences: peers behind symmetric NAT may fail to connect. The signaling server no longer depends on `hmac` or `sha1`. ADR-505 brings `base64` back only to decode Basic credentials. ADR-006 is historical and superseded. Coturn deploy files are removed by ADR-506.
+
+### ADR-505: Shared password via HTTP Basic
+
+Context: the signaling server was open to anyone who could reach it. The operator wants a password, as part of config, enough to stop strangers connecting.
+Decision: `CHATTERCRAB_PASSWORD` (empty means off) and `CHATTERCRAB_AUTH_USER` (default `chattercrab`). When the password is set, all routes except `GET /health` and CORS preflight require HTTP Basic. The client stores `auth_user` and `password` in `config.toml` and sends them on REST and on the WebSocket upgrade. Comparison is constant-time. Failures are a single `401` / `unauthorized`.
+Consequences: the password sits in the server environment and in the client config file in plaintext. `GET /health` does not reveal rooms. Peers still exchange media directly; the password only guards signaling.
+
+### ADR-506: Docker Compose and Traefik, no TURN
+
+Context: deployment was a static binary plus Coturn under systemd (ADR-401 and the surrounding deploy ADRs). The operator wants a Docker image on a VPS, Compose, and Traefik, and does not want TURN.
+Decision: Dockerfile builds chattercrab-signal and serves plain HTTP on 8080 as user chattercrab. docker-compose.yml runs Traefik v3 (ports 80 and 443, Let's Encrypt HTTP-01) and the server with no published port. CHATTERCRAB_PASSWORD is required by the compose file. CHATTERCRAB_STUN_URL defaults to stun:stun.l.google.com:19302. Coturn, the systemd unit, and install.sh are removed.
+Consequences: TLS and certificates are Traefik's job. The Rust server does not see client certificates. Media is not relayed. The password is in the compose environment (visible to anyone who can inspect the container). ADR-401's installer is no longer the supported path.

@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 chattercrab-protocol.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -36,6 +37,29 @@ audio_thread_priority = { version = "0.38.0", default-features = false }
 xcap = "0.9.8"
 fast_image_resize = "6.1.0"
 openh264 = "0.9.9"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# VA-API is resolved at runtime (libva.so.2, libva-drm.so.2) so the Linux
+# build keeps working on hosts that do not have libva-dev installed.
+libloading = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+# `windows::core::implement` emits `::windows_core::...` paths, so the crate must be
+# a direct dependency for the system-audio completion handler.
+windows-core = "0.62.2"
+# Hardware H.264 via the GPU's Media Foundation encoder (NVENC, Quick Sync, or AMF).
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Media_Audio",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

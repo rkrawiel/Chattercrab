@@ -12,9 +12,10 @@ use ringbuf::{HeapCons, HeapProd, HeapRb};
 use tokio::sync::mpsc;
 
 use super::resample::MonoResampler;
+use super::share::ShareMix;
 use super::{
-    FRAME_CHANNEL_CAPACITY, FRAME_SAMPLES, MAX_OPUS_PACKET, OpusFrame, SAMPLE_RATE, device_name,
-    find_input_device, new_opus_encoder, rms_f32,
+    FRAME_CHANNEL_CAPACITY, FRAME_SAMPLES, MAX_OPUS_PACKET, OpusFrame, SAMPLE_RATE,
+    apply_input_gain, device_name, find_input_device, new_opus_encoder, rms_f32,
 };
 use crate::MediaError;
 use crate::denoise::{DENOISE_FRAME_LEN, Denoiser};
@@ -78,12 +79,17 @@ impl AudioInput {
     ///
     /// `muted` replaces captured audio with silence (the stream keeps running and Opus
     /// DTX keeps packets tiny). `denoise` enables noise suppression on unmuted frames.
-    /// `level` receives the RMS of each frame as `f32` bits.
+    /// `gain` is the microphone preamp as `f32` bits (`1.0` unity, `5.0` is 500%).
+    /// `share` mixes system audio into each frame while a consumer is attached.
+    /// `level` receives the RMS of each microphone frame as `f32` bits, after gain
+    /// and before the system-audio mix.
     /// This call blocks while the device opens; call it from a blocking context.
     pub fn start(
         device: Option<&str>,
         muted: Arc<AtomicBool>,
         denoise: Arc<AtomicBool>,
+        gain: Arc<AtomicU32>,
+        share: Arc<ShareMix>,
         level: Arc<AtomicU32>,
     ) -> Result<Self, MediaError> {
         let device = find_input_device(device)?;
@@ -142,7 +148,12 @@ impl AudioInput {
             cons,
             name,
             rate,
-            Flags { muted, denoise },
+            Flags {
+                muted,
+                denoise,
+                gain,
+                share,
+            },
             level,
             stats,
             epoch,
@@ -161,6 +172,8 @@ impl AudioInput {
         hz: f32,
         muted: Arc<AtomicBool>,
         denoise: Arc<AtomicBool>,
+        gain: Arc<AtomicU32>,
+        share: Arc<ShareMix>,
         level: Arc<AtomicU32>,
     ) -> Result<Self, MediaError> {
         if !(hz.is_finite() && hz > 0.0 && hz < SAMPLE_RATE as f32 / 2.0) {
@@ -177,7 +190,12 @@ impl AudioInput {
             cons,
             name.clone(),
             SAMPLE_RATE,
-            Flags { muted, denoise },
+            Flags {
+                muted,
+                denoise,
+                gain,
+                share,
+            },
             level,
             stats.clone(),
             epoch,
@@ -346,6 +364,10 @@ where
 struct Flags {
     muted: Arc<AtomicBool>,
     denoise: Arc<AtomicBool>,
+    /// Microphone gain as `f32` bits.
+    gain: Arc<AtomicU32>,
+    /// System audio mixed in after the microphone is processed.
+    share: Arc<ShareMix>,
 }
 
 /// State owned by the encoder thread.
@@ -410,7 +432,6 @@ impl EncoderWorker {
         // All buffers are allocated once, here.
         let mut input = vec![0f32; chunk];
         let mut acc: Vec<f32> = Vec::with_capacity(FRAME_SAMPLES + max_out);
-        let silence = [0f32; FRAME_SAMPLES];
         let mut frame_buf = [0f32; DENOISE_FRAME_LEN];
         // Built here, on the encoder thread: the denoiser warms thread-local state in
         // `new`, so constructing it elsewhere would allocate on the first `process`.
@@ -444,6 +465,7 @@ impl EncoderWorker {
             while acc.len() >= FRAME_SAMPLES {
                 let muted = self.flags.muted.load(Ordering::Relaxed);
                 let denoise_on = self.flags.denoise.load(Ordering::Relaxed);
+                let gain = f32::from_bits(self.flags.gain.load(Ordering::Relaxed));
                 // Reset when suppression switches on, and on unmute while it is on, so the
                 // denoiser's 10 ms of internal history never replays stale audio.
                 if denoise_on && (!denoise_was_on || (was_muted && !muted)) {
@@ -451,18 +473,22 @@ impl EncoderWorker {
                 }
                 denoise_was_on = denoise_on;
                 was_muted = muted;
-                let frame: &[f32] = if muted {
-                    &silence
-                } else if denoise_on {
-                    frame_buf.copy_from_slice(&acc[..FRAME_SAMPLES]);
-                    denoiser.process(&mut frame_buf);
-                    &frame_buf
+                if muted {
+                    frame_buf.fill(0.0);
                 } else {
-                    &acc[..FRAME_SAMPLES]
-                };
-                let rms = if muted { 0.0 } else { rms_f32(frame) };
+                    frame_buf.copy_from_slice(&acc[..FRAME_SAMPLES]);
+                    // Suppression runs on the captured level. Gain comes after, so a quiet
+                    // mic is boosted without first amplifying the noise the denoiser removes.
+                    if denoise_on {
+                        denoiser.process(&mut frame_buf);
+                    }
+                    apply_input_gain(&mut frame_buf, gain);
+                }
+                let rms = if muted { 0.0 } else { rms_f32(&frame_buf) };
                 self.level.store(rms.to_bits(), Ordering::Relaxed);
-                match self.encoder.encode_float(frame, &mut packet) {
+                // Mute silences the microphone only. Shared application audio still goes out.
+                self.flags.share.mix_into(&mut frame_buf);
+                match self.encoder.encode_float(&frame_buf, &mut packet) {
                     Ok(len) => {
                         if let Some(f) = OpusFrame::new(&packet[..len], index) {
                             index += 1;
@@ -522,18 +548,30 @@ impl EncoderWorker {
 mod tests {
     use super::*;
 
-    fn flags() -> (Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicU32>) {
-        (
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicU32::new(0)),
-        )
+    struct Controls {
+        muted: Arc<AtomicBool>,
+        denoise: Arc<AtomicBool>,
+        gain: Arc<AtomicU32>,
+        share: Arc<ShareMix>,
+        level: Arc<AtomicU32>,
+    }
+
+    fn controls() -> Controls {
+        Controls {
+            muted: Arc::new(AtomicBool::new(false)),
+            denoise: Arc::new(AtomicBool::new(false)),
+            gain: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            share: ShareMix::new(),
+            level: Arc::new(AtomicU32::new(0)),
+        }
     }
 
     #[test]
     fn tone_produces_paced_opus_frames_without_a_device() {
-        let (muted, denoise, level) = flags();
-        let mut input = AudioInput::start_tone(440.0, muted, denoise, level.clone()).unwrap();
+        let c = controls();
+        let mut input =
+            AudioInput::start_tone(440.0, c.muted, c.denoise, c.gain, c.share, c.level.clone())
+                .unwrap();
         assert_eq!(input.device_rate, SAMPLE_RATE);
         std::thread::sleep(Duration::from_millis(500));
         let mut frames = 0;
@@ -543,23 +581,38 @@ mod tests {
         }
         // 500 ms of real-time audio is 25 frames; allow for scheduling jitter.
         assert!((15..=40).contains(&frames), "got {frames} frames");
-        assert!(f32::from_bits(level.load(Ordering::Relaxed)) > 0.05);
+        assert!(f32::from_bits(c.level.load(Ordering::Relaxed)) > 0.05);
     }
 
     #[test]
     fn muted_tone_reports_zero_level() {
-        let (muted, denoise, level) = flags();
-        muted.store(true, Ordering::Relaxed);
-        let _input = AudioInput::start_tone(440.0, muted, denoise, level.clone()).unwrap();
+        let c = controls();
+        c.muted.store(true, Ordering::Relaxed);
+        let _input =
+            AudioInput::start_tone(440.0, c.muted, c.denoise, c.gain, c.share, c.level.clone())
+                .unwrap();
         std::thread::sleep(Duration::from_millis(200));
-        assert_eq!(f32::from_bits(level.load(Ordering::Relaxed)), 0.0);
+        assert_eq!(f32::from_bits(c.level.load(Ordering::Relaxed)), 0.0);
+    }
+
+    #[test]
+    fn zero_gain_reports_zero_level() {
+        let c = controls();
+        c.gain.store(0.0f32.to_bits(), Ordering::Relaxed);
+        let _input =
+            AudioInput::start_tone(440.0, c.muted, c.denoise, c.gain, c.share, c.level.clone())
+                .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(f32::from_bits(c.level.load(Ordering::Relaxed)), 0.0);
     }
 
     #[test]
     fn rejects_invalid_tone_frequency() {
         for hz in [0.0, -1.0, 24_000.0, f32::NAN] {
-            let (muted, denoise, level) = flags();
-            assert!(AudioInput::start_tone(hz, muted, denoise, level).is_err());
+            let c = controls();
+            assert!(
+                AudioInput::start_tone(hz, c.muted, c.denoise, c.gain, c.share, c.level).is_err()
+            );
         }
     }
 }

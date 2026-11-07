@@ -77,10 +77,13 @@ impl RtpAudioPacket {
     }
 }
 
+/// Highest per-peer playback gain. `5.0` is 500%.
+pub const PEER_VOLUME_MAX: f32 = 5.0;
+
 /// Shared per-peer controls visible outside the mixer thread.
 #[derive(Debug, Clone)]
 pub struct PeerAudioControls {
-    /// Linear gain as `f32` bits (0.0..=2.0).
+    /// Linear gain as `f32` bits (0.0..=[`PEER_VOLUME_MAX`]).
     pub volume: Arc<AtomicU32>,
     /// Last frame RMS as `f32` bits.
     pub level: Arc<AtomicU32>,
@@ -94,10 +97,10 @@ impl PeerAudioControls {
         }
     }
 
-    /// Sets the gain, clamped to 0.0..=2.0.
+    /// Sets the gain, clamped to 0.0..=[`PEER_VOLUME_MAX`].
     pub fn set_volume(&self, volume: f32) {
         let v = if volume.is_finite() {
-            volume.clamp(0.0, 2.0)
+            volume.clamp(0.0, PEER_VOLUME_MAX)
         } else {
             1.0
         };
@@ -515,7 +518,9 @@ mod tests {
     fn controls_clamp_volume() {
         let c = PeerAudioControls::new();
         c.set_volume(5.0);
-        assert_eq!(gain_q12(&c), 2 * GAIN_ONE);
+        assert_eq!(gain_q12(&c), 5 * GAIN_ONE);
+        c.set_volume(9.0);
+        assert_eq!(gain_q12(&c), 5 * GAIN_ONE);
         c.set_volume(-1.0);
         assert_eq!(gain_q12(&c), 0);
         c.set_volume(f32::NAN);

@@ -151,8 +151,8 @@ async fn audio_flows_and_screen_glare_resolves() {
         if audio_ok && !screen_started {
             // Both sides start sharing at once: renegotiation glare.
             screen_started = true;
-            a.pm.set_screen_active(true).await;
-            b.pm.set_screen_active(true).await;
+            a.pm.set_screen_active(true, false, 30).await;
+            b.pm.set_screen_active(true, false, 30).await;
         }
         let video_ok =
             a.video_rx.load(Ordering::Relaxed) >= 5 && b.video_rx.load(Ordering::Relaxed) >= 5;

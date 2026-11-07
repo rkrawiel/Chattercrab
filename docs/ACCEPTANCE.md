@@ -70,7 +70,7 @@ The 90-second rehearsal of the same setup ended with every participant `peers_co
 | Requirement | Status | Evidence |
 |-------------|--------|----------|
 | `RoomId`, `PeerId` (UUID v4), `DisplayName` (validated, 1 to 32 chars, trimmed) | PASS | `crates/protocol/src/ids.rs`; tests `display_name_rules`, `room_id_rules`, `peer_id_order_matches_string_order`. |
-| REST models `RoomSummary`, `CreateRoomRequest`, `TurnCredentials` | PASS | `crates/protocol/src/rest.rs`. |
+| REST models `RoomSummary`, `CreateRoomRequest`, `IceServers` | PASS | `crates/protocol/src/rest.rs`. `IceServers` is `{ "urls": ["stun:…"] }` with no username or credential (ADR-504). |
 | WS enums, `#[serde(tag = "t", rename_all = "snake_case")]`, all listed variants | PASS | `crates/protocol/src/ws.rs`. `Chat` text limit enforced by `validate_chat_text` (2000 characters). |
 | Round-trip tests for every variant | PASS | `every_client_msg_roundtrips`, `every_server_msg_roundtrips`, `tag_field_and_snake_case_names`, `exact_wire_format`. |
 
@@ -78,11 +78,12 @@ The 90-second rehearsal of the same setup ended with every participant `peers_co
 
 | Requirement | Status | Evidence |
 |-------------|--------|----------|
-| Stack: tokio, axum `ws`, axum-server rustls, tower-http (cors, trace, limit), dashmap, tracing JSON, hmac/sha1/base64 | PASS | `crates/server/Cargo.toml`. axum-server uses `tls-rustls-no-provider` with ring instead of aws-lc (ADR-100). |
-| Env config with the listed variables and defaults | PASS | `crates/server/src/config.rs`; `deploy/chattercrab.env.example`. |
+| Stack: tokio, axum `ws`, axum-server rustls, tower-http (cors, trace, limit), dashmap, tracing JSON | PASS | `crates/server/Cargo.toml`. axum-server uses `tls-rustls-no-provider` with ring instead of aws-lc (ADR-100). No `hmac` or `sha1` (ADR-504). `base64` decodes HTTP Basic credentials (ADR-505). |
+| Env config with the listed variables and defaults | PASS | `crates/server/src/config.rs`; container overrides in `docker-compose.yml` and `.env.example`. |
 | `Arc<AppState>` with `DashMap<RoomId, Room>`, per-room tokio Mutex, no global lock | PASS | `crates/server/src/state.rs` (`Arc<Room>` values, `Mutex<RoomInner>`). |
-| Routes `/health`, `/rooms` GET and POST (rate limited, max rooms), `/turn-credentials`, `/ws/{room_id}` | PASS | `crates/server/src/http.rs`; tests `health_reports_ok`, `create_and_list_rooms`, `create_room_rate_limited`, `max_rooms_enforced`, `turn_credentials_are_valid_hmac`, `ws_to_unknown_room_is_404`. |
-| TURN REST credentials, TTL 12 h | PASS | `crates/server/src/turn.rs` (`TURN_TTL_SECS`); HMAC checked against a reference value computed independently in Python. |
+| Routes `/health`, `/rooms` GET and POST (rate limited, max rooms), `/ice-servers`, `/ws/{room_id}` | PASS | `crates/server/src/http.rs`; tests `health_reports_ok`, `create_and_list_rooms`, `create_room_rate_limited`, `max_rooms_enforced`, `ice_servers_returns_configured_stun_url`, `ice_servers_reflects_custom_stun_url`, `ice_servers_rate_limited`, `ws_to_unknown_room_is_404`. `GET /turn-credentials` is not served. |
+| `GET /ice-servers` returns the configured STUN URL and no credential | PASS | Default `stun:stun.l.google.com:19302` (`CHATTERCRAB_STUN_URL`). Response is `{ "urls": ["<that url>"] }` with no username or credential. `turn:` and `turns:` URLs are rejected at config load. No TURN relay. |
+| Optional shared Basic auth | PASS | `CHATTERCRAB_PASSWORD` empty or unset leaves the server open. When set, `GET /health` and CORS `OPTIONS` stay open and every other route requires `Authorization: Basic` (`401` / `unauthorized`, `WWW-Authenticate: Basic realm="chattercrab"`). Comparison is constant-time. The client stores `auth_user` and `password` in `config.toml` (ADR-505). |
 | Join within 5 s | PASS | `join_timeout_closes_socket`. |
 | Room size enforced | PASS | `room_full_rejected`. |
 | Outbound queue 256, slow consumer dropped | PASS | `OUTBOUND_QUEUE_CAPACITY = 256`; `slow_consumer_is_kicked`. |
@@ -92,7 +93,7 @@ The 90-second rehearsal of the same setup ended with every participant `peers_co
 | Idle sweeper every 60 s | PASS | `idle_empty_rooms_are_evicted`; only empty rooms are evicted (ADR-003). |
 | TLS reload on SIGHUP without dropping connections | PASS | `serves_https_and_reloads_certificate`: after a reload the new certificate is served and the old one is not, and a broken key file keeps the current certificate. Existing connections are untouched by design, because `RustlsConfig::reload_from_config` swaps the config only for new handshakes; there is no dedicated test for that part. SIGHUP handler in `crates/server/src/main.rs`. |
 | Graceful SIGTERM within 10 s | PASS | `graceful_shutdown_sends_going_away`; Linux release binary exited 4 ms after SIGTERM. |
-| Integration tests with tokio-tungstenite on an ephemeral port | PASS | `crates/server/tests/` (23 tests). |
+| Integration tests with tokio-tungstenite on an ephemeral port | PASS | `crates/server/tests/` (29 tests). |
 | Static musl binary | PASS | `file`: "statically linked"; `ldd`: "not a dynamic executable"; 3,891,000 bytes. |
 
 ## 5. Media crate
@@ -100,7 +101,7 @@ The 90-second rehearsal of the same setup ended with every participant `peers_co
 | Requirement | Status | Evidence |
 |-------------|--------|----------|
 | Modules `audio`, `screen`, `peer`, `mixer`, `jitter` | PASS | `crates/media/src/`, plus `denoise`. |
-| cpal capture, rubato to 48 kHz, 20 ms frames via SPSC ring, Opus VoIP 32 kbps, DTX, FEC, complexity 5 | PASS | `crates/media/src/audio/capture.rs` (ADR-206, ADR-207). |
+| cpal capture, rubato to 48 kHz, 20 ms frames via SPSC ring, Opus VoIP 96 kbps, DTX, FEC, complexity 5 | PASS | `crates/media/src/audio/capture.rs` (ADR-206, ADR-207, ADR-503). |
 | Device enumeration and selection by name; mute sends silence | PASS | `list_input_devices`/`list_output_devices`; `MediaCommand::SetMuted`. |
 | Adaptive jitter buffer, target 40 ms, max 120 ms, FEC or PLC | PASS | `crates/media/src/jitter.rs`; 12 tests including reorder, FEC, PLC, late, overflow and wraparound. |
 | Mixer on an RT-priority thread, i32 sum, soft-knee limiter, no allocation in the loop, per-peer volume 0 to 2, deafen | PASS | `crates/media/src/mixer.rs`; tests cover summing, silence, limiter bounds, volume, deafen and real Opus decode. |
@@ -129,14 +130,11 @@ The 90-second rehearsal of the same setup ended with every participant `peers_co
 
 | Requirement | Status | Evidence |
 |-------------|--------|----------|
-| All files under `deploy/` as specified | PASS | `build-release.sh`, `install.sh`, `chattercrab-signal.service` (verbatim), `chattercrab.env.example` (verbatim), `turnserver.conf` (verbatim), `coturn-override.conf`, `firewall.sh`, `certbot-deploy-hook.sh`. |
-| `build-release.sh`: targets, zigbuild/cross/cargo, `dist/` layout, SHA256SUMS, sizes, static check | PASS | Full run in WSL: server 3,891,000 B (static), Linux client 22,495,200 B, Windows client 19,658,240 B, `dist/SHA256SUMS` written. |
-| `systemd-analyze verify deploy/chattercrab-signal.service` | PASS | "systemd-analyze verify: clean" (WSL with systemd); `systemd-analyze security` rates it 2.4 OK. |
-| Scripts lint | PASS | `bash -n` and `shellcheck -S style` clean on every script. |
-| `install.sh` idempotent, secret shared with coturn, NAT detection | PASS | Ran twice in WSL. The second run kept the env file and secret; the secret matches `/etc/turnserver.conf`; `external-ip` was set. Coturn allocated with REST credentials and rejected a wrong secret. |
-| `firewall.sh` | PARTIAL | Verified with `--dry-run` only; not enabled inside WSL, to avoid breaking its networking. |
-| Certbot issuance | OPEN | Needs public DNS. The deploy hook was exercised with a self-signed certificate. |
-| `docs/DEPLOY.md` | PASS | DNS, certbot, installer, `turnutils_uclient`, health check, journalctl, upgrade and troubleshooting sections. |
+| Docker Compose files at the repo root | PASS (files only) | `Dockerfile`, `.dockerignore`, `docker-compose.yml`, `.env.example`. The image was not built in this environment: `docker` is not installed, and Docker was not installed to run `docker compose config` or `docker build`. |
+| Coturn installer and systemd unit removed | PASS | Deleted `deploy/install.sh`, `deploy/firewall.sh`, `deploy/certbot-deploy-hook.sh`, `deploy/coturn-override.conf`, `deploy/turnserver.conf`, `deploy/chattercrab-signal.service`, and `deploy/chattercrab.env.example`. `deploy/build-release.sh` no longer copies them. `deploy/wsl-verify.sh` no longer runs `systemd-analyze`. |
+| `build-release.sh`: targets, zigbuild/cross/cargo, `dist/` layout, SHA256SUMS, sizes, static check | PASS (previous run) | Full run in WSL before this deploy change: server 3,891,000 B (static), Linux client 22,495,200 B, Windows client 19,658,240 B, `dist/SHA256SUMS` written. This phase did not re-run the release build. The script still fails when the server binary is not static, and it no longer copies Coturn or systemd assets. |
+| Scripts lint | PASS | `bash -n` on `deploy/build-release.sh` and `deploy/wsl-verify.sh` after the Coturn removal. ShellCheck was not re-run here. |
+| `docs/DEPLOY.md` | PASS | Rewritten for Compose and Traefik: DNS, Docker Engine, firewall 22/80/443, `.env`, `docker compose up -d --build`, client URL on port 443, health and 401 checks, logs, upgrade, external STUN, troubleshooting. No Coturn installer. |
 
 ## 8. Known gaps and follow-ups
 

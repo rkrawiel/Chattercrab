@@ -8,18 +8,21 @@ use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, Path, State, WebSocketUpgrade};
 use axum::http::{Method, StatusCode, header};
+use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use chattercrab_protocol::{
-    ApiError, ErrorCode, HealthResponse, MAX_WS_MESSAGE_BYTES, RoomId, RoomName, RoomSummary,
+    ApiError, ErrorCode, HealthResponse, IceServers, MAX_WS_MESSAGE_BYTES, RoomId, RoomName,
+    RoomSummary,
 };
 use serde::Deserialize;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::state::{AppState, CreateRoomError, now_secs};
-use crate::{turn, ws};
+use crate::auth;
+use crate::state::{AppState, CreateRoomError};
+use crate::ws;
 
 /// Maximum REST request body size.
 pub const MAX_BODY_BYTES: usize = 16 * 1024;
@@ -29,13 +32,18 @@ pub fn router(state: Arc<AppState>) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::GET, Method::POST])
-        .allow_headers([header::CONTENT_TYPE]);
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
+    // CORS is outside auth so a preflight OPTIONS is answered before credentials are required.
     Router::new()
         .route("/health", get(health))
         .route("/rooms", get(list_rooms).post(create_room))
-        .route("/turn-credentials", get(turn_credentials))
+        .route("/ice-servers", get(ice_servers))
         .route("/ws/{room_id}", get(ws_upgrade))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_basic_auth,
+        ))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -112,35 +120,21 @@ async fn create_room(
     }
 }
 
-async fn turn_credentials(
+async fn ice_servers(
     State(state): State<Arc<AppState>>,
     ConnectInfo(remote): ConnectInfo<SocketAddr>,
 ) -> Response {
-    if !state.allow_turn_credentials(remote.ip()) {
+    if !state.allow_ice_servers(remote.ip()) {
         return api_error(
             StatusCode::TOO_MANY_REQUESTS,
             ErrorCode::RateLimited,
-            "too many credential requests, try again later",
+            "too many ICE server requests, try again later",
         );
     }
-    let Some(turn) = &state.config.turn else {
-        return api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            ErrorCode::TurnUnavailable,
-            "TURN is not configured on this server",
-        );
-    };
-    match turn::issue(turn, now_secs()) {
-        Ok(creds) => Json(creds).into_response(),
-        Err(err) => {
-            tracing::error!(%err, "cannot issue TURN credentials");
-            api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ErrorCode::Internal,
-                "internal error",
-            )
-        }
-    }
+    Json(IceServers {
+        urls: vec![state.config.stun_url.clone()],
+    })
+    .into_response()
 }
 
 async fn ws_upgrade(

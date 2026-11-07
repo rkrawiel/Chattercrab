@@ -27,12 +27,15 @@ bytes = "1.12.1"
 directories = "6.0.0"
 toml = "1.2.0"
 # Minimal iced: wgpu with a tiny-skia software fallback, the image widget without
-# codecs (frames arrive as raw RGBA) and the Tokio executor.
-iced = { version = "0.14.0", default-features = false, features = ["tokio", "image-without-codecs", "wgpu", "tiny-skia"] }
+# codecs (frames arrive as raw RGBA), the Tokio executor, and custom widgets
+# (selectable chat text).
+iced = { version = "0.14.0", default-features = false, features = ["tokio", "image-without-codecs", "wgpu", "tiny-skia", "advanced"] }
+iced_runtime = "0.14.0"
 # ring is the single crypto provider for every TLS user in the client (no aws-lc).
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "http2"] }
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
+base64 = "0.23"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 iced = { version = "0.14.0", default-features = false, features = ["x11"] }

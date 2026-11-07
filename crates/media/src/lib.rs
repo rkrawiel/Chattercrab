@@ -3,7 +3,9 @@
 //! The GUI never touches WebRTC or audio devices directly. It starts a [`MediaEngine`],
 //! sends [`MediaCommand`]s and reacts to [`MediaEvent`]s, all over bounded
 //! `tokio::sync::mpsc` channels. Decoded remote screen-share frames are delivered
-//! through a [`VideoFrameQueue`] (capacity 2, oldest frame dropped when full).
+//! through a [`VideoFrameQueue`]. The queue keeps the frames it already has when it
+//! is full; the screen receiver plays them on a clock up to one second behind the
+//! sender so a jittery share stays smooth.
 //!
 //! The types in this file are the public API contract shared by the media engine and
 //! the client (additive changes are recorded in `API_CHANGES.md`). The building blocks
@@ -23,9 +25,11 @@ pub mod peer;
 pub mod screen;
 mod video_queue;
 
+pub use audio::{INPUT_GAIN_MAX, INPUT_GAIN_MIN, clamp_input_gain};
+pub use mixer::PEER_VOLUME_MAX;
 pub use video_queue::{RgbaFrame, VideoFrameQueue};
 
-use chattercrab_protocol::{PeerId, TurnCredentials};
+use chattercrab_protocol::{IceServers, PeerId};
 use tokio::sync::mpsc;
 
 /// Capacity of the command channel into the engine.
@@ -57,7 +61,7 @@ pub enum MediaError {
 }
 
 /// Initial engine configuration.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct MediaConfig {
     /// Input device name; `None` selects the system default.
     pub input_device: Option<String>,
@@ -65,6 +69,19 @@ pub struct MediaConfig {
     pub output_device: Option<String>,
     /// Enable RNNoise-based noise suppression on the microphone input.
     pub noise_suppression: bool,
+    /// Microphone gain. `1.0` is unity, `5.0` is 500%. Clamped when applied.
+    pub input_gain: f32,
+}
+
+impl Default for MediaConfig {
+    fn default() -> Self {
+        Self {
+            input_device: None,
+            output_device: None,
+            noise_suppression: false,
+            input_gain: 1.0,
+        }
+    }
 }
 
 /// Diagnostic engine options, separate from [`MediaConfig`] so that adding them does not
@@ -84,6 +101,77 @@ pub enum ScreenSourceKind {
     Monitor,
     /// A single window.
     Window,
+}
+
+/// Resolution cap applied before encoding. The picture is never scaled up.
+///
+/// Older configs used `full`, `half`, and `2160p`. Those load as [`Self::P1440`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenScale {
+    /// Fit inside 1920×1080.
+    #[serde(rename = "1080p")]
+    P1080,
+    /// Fit inside 2560×1440. Default.
+    #[default]
+    #[serde(rename = "1440p", alias = "2160p", alias = "full", alias = "half")]
+    P1440,
+    /// Fit inside 2560×1440, the 2K name for the same cap as [`Self::P1440`].
+    #[serde(rename = "2k")]
+    P2K,
+    /// Fit inside 3840×2160.
+    #[serde(rename = "4k")]
+    P4K,
+}
+
+impl ScreenScale {
+    /// Maximum encoded width and height. Smaller captures stay at their own size.
+    pub fn max_dimensions(self) -> (u32, u32) {
+        match self {
+            Self::P1080 => (1920, 1080),
+            Self::P1440 | Self::P2K => (2560, 1440),
+            Self::P4K => (3840, 2160),
+        }
+    }
+}
+
+impl std::fmt::Display for ScreenScale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::P1080 => "1080p",
+            Self::P1440 => "1440p",
+            Self::P2K => "2K",
+            Self::P4K => "4K",
+        })
+    }
+}
+
+/// What the share is showing. The user picks this before the share starts.
+/// Resolution and frame rate stay independent of the choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenContent {
+    /// Crisp text and UI: screen-content tools, two references in high quality.
+    #[default]
+    Desktop,
+    /// Moving images: motion tools and, in high quality, more bits per frame.
+    Game,
+}
+
+impl ScreenContent {
+    /// Whether this choice uses the game operating point.
+    pub fn is_game(self) -> bool {
+        matches!(self, Self::Game)
+    }
+}
+
+impl std::fmt::Display for ScreenContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Desktop => "Desktop",
+            Self::Game => "Game",
+        })
+    }
 }
 
 /// A capturable monitor or window.
@@ -146,12 +234,12 @@ pub enum OutgoingSignal {
 #[derive(Debug, Clone)]
 pub enum MediaCommand {
     /// Set the local peer id (from `welcome`) and the ICE servers to use for every
-    /// peer connection created afterwards. `None` means host candidates only.
+    /// peer connection created afterwards.
     Configure {
         /// Our own peer id, used for perfect-negotiation politeness.
         me: PeerId,
-        /// TURN/STUN credentials from `GET /turn-credentials`.
-        ice: Option<TurnCredentials>,
+        /// STUN servers from `GET /ice-servers`. `None` or empty urls means host candidates only.
+        ice: Option<IceServers>,
     },
     /// Create a peer connection to `peer`. If `initiate` is true the engine sends the
     /// first offer (the newcomer does this for every peer listed in `welcome`);
@@ -201,7 +289,9 @@ pub enum MediaCommand {
     SetDeafened(bool),
     /// Enable or disable microphone noise suppression.
     SetNoiseSuppression(bool),
-    /// Per-peer playback volume, clamped to 0.0..=2.0.
+    /// Microphone gain, clamped to 0.0..=5.0 (`1.0` unity, `5.0` is 500%).
+    SetInputGain(f32),
+    /// Per-peer playback volume, clamped to 0.0..=5.0.
     SetPeerVolume {
         /// Remote peer.
         peer: PeerId,
@@ -216,8 +306,18 @@ pub enum MediaCommand {
     StartScreenShare {
         /// What to capture.
         source: ScreenSource,
-        /// Target frame rate, clamped to 5..=30.
+        /// Target frame rate, clamped to 5..=60, or 5..=120 when `high_quality`.
         fps: u32,
+        /// Fit inside 4K, 2K, 1440p, or 1080p. Smaller captures are not scaled up.
+        scale: ScreenScale,
+        /// Mix other applications' audio into the outgoing voice for this share.
+        include_audio: bool,
+        /// H.264 High at a fixed high bitrate, with IDR frames only when a
+        /// viewer asks, at most once a second. Frame rate stays 5..=120.
+        high_quality: bool,
+        /// Desktop (crisp fonts) or game (less blur on moving images).
+        /// Independent of `scale` and `fps`.
+        content: ScreenContent,
     },
     /// Stop publishing the screen share.
     StopScreenShare,

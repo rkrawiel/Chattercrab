@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use chattercrab_protocol::{PeerId, TurnCredentials};
+use chattercrab_protocol::{IceServers, PeerId};
 use rtc::ice::mdns::MulticastDnsMode;
 use rtc::ice::network_type::NetworkType;
 use rtc::interceptor::Slot;
@@ -54,8 +54,19 @@ use crate::{MediaError, OutgoingSignal, PeerConnectionState};
 const OPUS_PAYLOAD_TYPE: u8 = 111;
 /// RTP payload type registered for H.264 constrained baseline.
 const H264_PAYLOAD_TYPE: u8 = 102;
-/// H.264 format parameters (constrained baseline, level 3.1, non-interleaved).
-const H264_FMTP: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
+/// RTP payload type for H.264 High, used by the high-quality share.
+const H264_HIGH_PAYLOAD_TYPE: u8 = 104;
+/// H.264 format parameters (constrained baseline, level 5.2, non-interleaved).
+/// Level 5.2 covers 4K60. Smaller shares fit inside it.
+const H264_FMTP: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e034";
+/// H.264 High, level 5.2, non-interleaved. Level 5.2 covers 1440p120.
+/// fmtp matching ignores the level byte, so a level 5.1 bitstream still pairs
+/// with this. NACK, PLI, FIR and transport-cc are enabled; the shared encoder
+/// stays at a fixed bitrate and does not follow per-viewer congestion.
+const H264_HIGH_FMTP: &str =
+    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640034";
+/// Upper bound advertised on a high-quality encoding, matching the encoder ceiling.
+const H264_HIGH_MAX_BITRATE: u32 = 120_000_000;
 /// Opus format parameters.
 const OPUS_FMTP: &str = "minptime=10;useinbandfec=1";
 /// ICE: no activity for this long marks the connection disconnected.
@@ -286,6 +297,8 @@ pub struct PeerManager {
     internal_tx: mpsc::Sender<InternalEvent>,
     events: VecDeque<PeerEvent>,
     screen_active: bool,
+    screen_high_quality: bool,
+    screen_fps: u32,
     audio_targets: watch::Sender<SendTargets>,
     video_targets: watch::Sender<SendTargets>,
     keyframe_requested: Arc<AtomicBool>,
@@ -319,7 +332,7 @@ fn opus_codec() -> RTCRtpCodec {
     }
 }
 
-fn h264_codec() -> RTCRtpCodec {
+fn h264_codec(fmtp: &str) -> RTCRtpCodec {
     let fb = |typ: &str, parameter: &str| RTCPFeedback {
         typ: typ.to_owned(),
         parameter: parameter.to_owned(),
@@ -328,15 +341,25 @@ fn h264_codec() -> RTCRtpCodec {
         mime_type: MIME_TYPE_H264.to_owned(),
         clock_rate: 90_000,
         channels: 0,
-        sdp_fmtp_line: H264_FMTP.to_owned(),
-        rtcp_feedback: vec![fb("nack", ""), fb("nack", "pli"), fb("ccm", "fir")],
+        sdp_fmtp_line: fmtp.to_owned(),
+        rtcp_feedback: vec![
+            fb("nack", ""),
+            fb("nack", "pli"),
+            fb("ccm", "fir"),
+            fb("transport-cc", ""),
+        ],
     }
 }
 
-fn new_local_track(kind: RtpCodecKind) -> Result<(Arc<TrackLocalStaticSample>, u32), MediaError> {
+fn new_local_track(
+    kind: RtpCodecKind,
+    high_quality: bool,
+    fps: u32,
+) -> Result<(Arc<TrackLocalStaticSample>, u32), MediaError> {
     let ssrc: u32 = rand::random();
     let (codec, track_id) = match kind {
-        RtpCodecKind::Video => (h264_codec(), "screen"),
+        RtpCodecKind::Video if high_quality => (h264_codec(H264_HIGH_FMTP), "screen"),
+        RtpCodecKind::Video => (h264_codec(H264_FMTP), "screen"),
         _ => (opus_codec(), "audio"),
     };
     let track = MediaStreamTrack::new(
@@ -350,6 +373,12 @@ fn new_local_track(kind: RtpCodecKind) -> Result<(Arc<TrackLocalStaticSample>, u
                 ..Default::default()
             },
             codec,
+            max_bitrate: if high_quality {
+                H264_HIGH_MAX_BITRATE
+            } else {
+                0
+            },
+            max_framerate: high_quality.then_some(f64::from(fps.max(1))),
             ..Default::default()
         }],
     );
@@ -374,6 +403,8 @@ impl PeerManager {
                 internal_tx: tx,
                 events: VecDeque::new(),
                 screen_active: false,
+                screen_high_quality: false,
+                screen_fps: 0,
                 audio_targets,
                 video_targets,
                 keyframe_requested: Arc::new(AtomicBool::new(false)),
@@ -383,15 +414,15 @@ impl PeerManager {
     }
 
     /// Sets our peer id and the ICE servers for connections created afterwards.
-    pub fn configure(&mut self, me: PeerId, ice: Option<&TurnCredentials>) {
+    pub fn configure(&mut self, me: PeerId, ice: Option<&IceServers>) {
         self.me = Some(me);
         self.ice_servers = ice
             .filter(|c| !c.urls.is_empty())
             .map(|c| {
                 vec![RTCIceServer {
                     urls: c.urls.clone(),
-                    username: c.username.clone(),
-                    credential: c.credential.clone(),
+                    username: String::new(),
+                    credential: String::new(),
                 }]
             })
             .unwrap_or_default();
@@ -447,8 +478,17 @@ impl PeerManager {
         media
             .register_codec(
                 RTCRtpCodecParameters {
-                    rtp_codec: h264_codec(),
+                    rtp_codec: h264_codec(H264_FMTP),
                     payload_type: H264_PAYLOAD_TYPE,
+                },
+                RtpCodecKind::Video,
+            )
+            .map_err(webrtc_err)?;
+        media
+            .register_codec(
+                RTCRtpCodecParameters {
+                    rtp_codec: h264_codec(H264_HIGH_FMTP),
+                    payload_type: H264_HIGH_PAYLOAD_TYPE,
                 },
                 RtpCodecKind::Video,
             )
@@ -560,7 +600,14 @@ impl PeerManager {
     }
 
     /// Starts or stops sending the screen-share track to every peer.
-    pub async fn set_screen_active(&mut self, active: bool) {
+    ///
+    /// `high_quality` selects H.264 High at the fixed high bitrate. `fps` is the
+    /// encoding's max frame rate. Both are stored when the share starts.
+    pub async fn set_screen_active(&mut self, active: bool, high_quality: bool, fps: u32) {
+        if active {
+            self.screen_high_quality = high_quality;
+            self.screen_fps = fps;
+        }
         if self.screen_active == active {
             return;
         }
@@ -578,6 +625,8 @@ impl PeerManager {
     /// Track changes trigger `negotiationneeded`, which drives the offer.
     async fn sync_tracks(&mut self, peer: PeerId) {
         let screen_active = self.screen_active;
+        let high_quality = self.screen_high_quality;
+        let fps = self.screen_fps;
         let keyframe = self.keyframe_requested.clone();
         let Some(entry) = self.peers.get_mut(&peer) else {
             return;
@@ -587,7 +636,7 @@ impl PeerManager {
         }
         let mut changed = false;
         if entry.audio.is_none() {
-            match attach_track(peer, &entry.pc, RtpCodecKind::Audio, None).await {
+            match attach_track(peer, &entry.pc, RtpCodecKind::Audio, None, false, 0).await {
                 Ok(s) => {
                     entry.audio = Some(s);
                     changed = true;
@@ -596,7 +645,16 @@ impl PeerManager {
             }
         }
         if screen_active && entry.video.is_none() {
-            match attach_track(peer, &entry.pc, RtpCodecKind::Video, Some(keyframe.clone())).await {
+            match attach_track(
+                peer,
+                &entry.pc,
+                RtpCodecKind::Video,
+                Some(keyframe.clone()),
+                high_quality,
+                fps,
+            )
+            .await
+            {
                 Ok(s) => {
                     entry.video = Some(s);
                     keyframe.store(true, Ordering::Relaxed);
@@ -893,8 +951,10 @@ async fn attach_track(
     pc: &Arc<dyn PeerConnection>,
     kind: RtpCodecKind,
     keyframe: Option<Arc<AtomicBool>>,
+    high_quality: bool,
+    fps: u32,
 ) -> Result<LocalSender, MediaError> {
-    let (track, ssrc) = new_local_track(kind)?;
+    let (track, ssrc) = new_local_track(kind, high_quality, fps)?;
     let sender = pc
         .add_track(track.clone() as Arc<dyn TrackLocal>)
         .await

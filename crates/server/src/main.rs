@@ -1,7 +1,7 @@
 //! `chattercrab-signal`: the Chattercrab signaling server binary.
 //!
 //! Configuration comes from `CHATTERCRAB_*` environment variables (see
-//! `deploy/chattercrab.env.example`). Logs are JSON lines on stdout.
+//! `.env.example` and `crates/server/README.md`). Logs are JSON lines on stdout.
 //! `SIGHUP` reloads the TLS certificate; `SIGTERM`/`SIGINT` shut down gracefully.
 
 use anyhow::Context;
@@ -23,7 +23,8 @@ fn main() -> anyhow::Result<()> {
         version = env!("CARGO_PKG_VERSION"),
         bind = %config.bind,
         tls = config.tls.is_some(),
-        turn = config.turn.is_some(),
+        stun_url = %config.stun_url,
+        auth = config.auth.is_some(),
         max_room_size = config.max_room_size,
         max_rooms = config.max_rooms,
         "starting chattercrab-signal"

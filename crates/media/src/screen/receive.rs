@@ -2,13 +2,14 @@
 //!
 //! An RTP reader task depacketizes the remote H.264 track into access units (one per
 //! marker bit), drops pictures after loss until the next IDR, and asks the publisher for
-//! a keyframe with PLI (at most every 500 ms). Access units go through a bounded channel
-//! of 8 to a decoder thread, which converts decoded pictures to RGBA and pushes them into
-//! the [`VideoFrameQueue`] (capacity 2, oldest dropped).
+//! a keyframe with PLI (at most every 500 ms). Access units wait in a playout buffer of
+//! up to one second. The decoder thread shows them on the RTP clock, so a burst of
+//! packets becomes a steady picture instead of a stutter. A viewer that falls further
+//! than that second behind skips pictures (still decoding them, so the stream stays
+//! valid) until it is inside the window again.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::time::{Duration, Instant};
 
 use openh264::OpenH264API;
@@ -19,14 +20,13 @@ use rtc::rtp::codec::h264::H264Packet;
 use rtc::rtp::packetizer::Depacketizer;
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 
+use super::playout::{AuBuffer, MAX_PLAYOUT_DELAY, PushError, SharedClock, Step, TimedAu, Wait};
 use crate::{MediaError, RgbaFrame, VideoFrameQueue};
 
-/// Access units buffered between the RTP reader and the decoder.
-const AU_CHANNEL_CAPACITY: usize = 8;
 /// Minimum interval between PLIs.
 const PLI_INTERVAL: Duration = Duration::from_millis(500);
 /// Upper bound for one access unit; larger ones are dropped.
-const MAX_AU_BYTES: usize = 4 * 1024 * 1024;
+const MAX_AU_BYTES: usize = 8 * 1024 * 1024;
 
 /// Whether an Annex-B buffer contains an IDR slice (NAL type 5).
 pub fn contains_idr(au: &[u8]) -> bool {
@@ -68,28 +68,42 @@ pub fn decode_to_rgba(decoder: &mut Decoder, au: &[u8]) -> Result<Option<RgbaFra
     }))
 }
 
+fn decode_discard(decoder: &mut Decoder, au: &[u8]) -> Result<(), MediaError> {
+    decoder
+        .decode(au)
+        .map(|_| ())
+        .map_err(|e| MediaError::Codec(format!("h264 decode: {e}")))
+}
+
 /// Reads `track` until it ends, decoding into `queue`. Returns when the track ends.
 pub async fn run_receiver(track: Arc<dyn TrackRemote>, queue: VideoFrameQueue) {
-    let (tx, rx) = sync_channel::<Vec<u8>>(AU_CHANNEL_CAPACITY);
+    queue.clear();
+    let buffer = AuBuffer::new();
+    let clock = SharedClock::new();
     let want_keyframe = Arc::new(AtomicBool::new(true));
-    let decoder_flag = want_keyframe.clone();
+    let decoder_buffer = Arc::clone(&buffer);
+    let decoder_clock = clock.clone();
+    let decoder_flag = Arc::clone(&want_keyframe);
     let decoder = std::thread::Builder::new()
         .name("cc-screen-decoder".into())
-        .spawn(move || decode_loop(rx, queue, decoder_flag));
+        .spawn(move || decode_loop(decoder_buffer, decoder_clock, queue, decoder_flag));
     if let Err(e) = decoder {
         tracing::warn!("spawn decoder thread: {e}");
         return;
     }
-    read_loop(track, tx, want_keyframe).await;
+    read_loop(track, &buffer, &clock, &want_keyframe).await;
+    buffer.close();
 }
 
 async fn read_loop(
     track: Arc<dyn TrackRemote>,
-    tx: SyncSender<Vec<u8>>,
-    want_keyframe: Arc<AtomicBool>,
+    buffer: &AuBuffer,
+    clock: &SharedClock,
+    want_keyframe: &AtomicBool,
 ) {
     let mut depacketizer = H264Packet::default();
     let mut au: Vec<u8> = Vec::with_capacity(256 * 1024);
+    let mut au_ts: Option<u32> = None;
     let mut last_seq: Option<u16> = None;
     let mut last_pli: Option<Instant> = None;
     let mut waiting_for_idr = true;
@@ -110,6 +124,9 @@ async fn read_loop(
             waiting_for_idr = true;
         }
         last_seq = Some(seq);
+        if au_ts.is_none() {
+            au_ts = Some(pkt.header.timestamp);
+        }
 
         match depacketizer.depacketize(&pkt.payload) {
             Ok(bytes) => {
@@ -123,18 +140,31 @@ async fn read_loop(
         }
 
         if pkt.header.marker {
+            let timestamp = au_ts.take().unwrap_or(pkt.header.timestamp);
             let complete = !corrupt && !au.is_empty();
-            if complete && waiting_for_idr && contains_idr(&au) {
+            let keyframe = complete && contains_idr(&au);
+            if complete && waiting_for_idr && keyframe {
                 waiting_for_idr = false;
             }
             if complete && !waiting_for_idr {
-                match tx.try_send(std::mem::replace(&mut au, Vec::with_capacity(64 * 1024))) {
+                let arrival = Instant::now();
+                clock.observe(timestamp, arrival);
+                let timed = TimedAu {
+                    data: std::mem::replace(&mut au, Vec::with_capacity(64 * 1024)),
+                    rtp_ts: timestamp,
+                    keyframe,
+                };
+                match buffer.push(timed) {
                     Ok(()) => {}
-                    Err(TrySendError::Full(_)) => waiting_for_idr = true,
-                    Err(TrySendError::Disconnected(_)) => return,
+                    Err(PushError::Overflow) => {
+                        tracing::debug!("screen playout buffer overflowed; waiting for a keyframe");
+                        waiting_for_idr = true;
+                    }
+                    Err(PushError::Closed) => return,
                 }
             }
             au.clear();
+            au_ts = None;
             corrupt = false;
         }
 
@@ -152,21 +182,206 @@ async fn read_loop(
     }
 }
 
-fn decode_loop(rx: Receiver<Vec<u8>>, queue: VideoFrameQueue, want_keyframe: Arc<AtomicBool>) {
+fn decode_loop(
+    buffer: Arc<AuBuffer>,
+    clock: SharedClock,
+    queue: VideoFrameQueue,
+    want_keyframe: Arc<AtomicBool>,
+) {
     let mut decoder = match new_decoder() {
-        Ok(d) => d,
+        Ok(decoder) => decoder,
         Err(e) => {
             tracing::warn!("{e}");
             return;
         }
     };
-    while let Ok(au) = rx.recv() {
-        match decode_to_rgba(&mut decoder, &au) {
-            Ok(Some(frame)) => queue.push(frame),
-            Ok(None) => {}
-            Err(e) => {
-                tracing::debug!("{e}");
-                want_keyframe.store(true, Ordering::Relaxed);
+    let mut generation = 0u64;
+    let mut need_idr = false;
+    let mut logged_start = false;
+    let mut empty_since: Option<Instant> = None;
+    loop {
+        if buffer.take_overflow() {
+            need_idr = true;
+            want_keyframe.store(true, Ordering::Relaxed);
+            clock.with_mut(super::playout::PlayoutClock::underrun);
+            decoder = match new_decoder() {
+                Ok(decoder) => decoder,
+                Err(e) => {
+                    tracing::warn!("{e}");
+                    return;
+                }
+            };
+        }
+
+        let timeout = clock.with_mut(|clock| clock.frame_duration());
+        let peeked = match buffer.wait_generation(generation, timeout) {
+            Wait::Closed => return,
+            Wait::Overflow => continue,
+            Wait::Timeout { queued: None } => {
+                let (started, cushion) =
+                    clock.with_mut(|clock| (clock.is_started(), clock.delay()));
+                if started {
+                    let since = empty_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= cushion {
+                        empty_since = None;
+                        clock.with_mut(super::playout::PlayoutClock::underrun);
+                        tracing::debug!("screen playout underrun; buffering again");
+                    }
+                }
+                continue;
+            }
+            Wait::Timeout { queued: Some(peek) } | Wait::Ready(peek) => {
+                empty_since = None;
+                peek
+            }
+        };
+        generation = peeked.generation;
+
+        if need_idr && !peeked.keyframe {
+            let _ = buffer.pop();
+            continue;
+        }
+        if need_idr {
+            need_idr = false;
+            clock.with_mut(super::playout::PlayoutClock::reset);
+            decoder = match new_decoder() {
+                Ok(decoder) => decoder,
+                Err(e) => {
+                    tracing::warn!("{e}");
+                    return;
+                }
+            };
+        }
+
+        let decision =
+            clock.with_mut(|clock| clock.step(peeked.oldest, peeked.newest, Instant::now()));
+        match decision {
+            Step::Buffer => continue,
+            Step::DecodeOnly => {
+                let skipped = clock.with_mut(|clock| clock.skipped());
+                if skipped == 1 || skipped.is_multiple_of(60) {
+                    tracing::debug!(skipped, "screen playout skipped a frame to stay within 1s");
+                }
+                if let Some(au) = buffer.pop()
+                    && decode_discard(&mut decoder, &au.data).is_err()
+                {
+                    need_idr = true;
+                    want_keyframe.store(true, Ordering::Relaxed);
+                }
+            }
+            Step::Present { at } => {
+                if !logged_start {
+                    logged_start = true;
+                    let delay = clock.with_mut(|clock| clock.delay());
+                    tracing::debug!(delay_ms = delay.as_millis(), "screen playout started");
+                }
+                let Some(au) = buffer.pop() else {
+                    continue;
+                };
+                if !present_frame(
+                    &buffer,
+                    &clock,
+                    &queue,
+                    &mut decoder,
+                    &want_keyframe,
+                    au,
+                    at,
+                ) {
+                    if buffer.is_closed() {
+                        return;
+                    }
+                    need_idr = true;
+                }
+            }
+        }
+    }
+}
+
+/// Decodes `au` and hands it to the UI at `at`.
+/// Returns false when the picture could not be decoded or the receiver stopped.
+fn present_frame(
+    buffer: &AuBuffer,
+    clock: &SharedClock,
+    queue: &VideoFrameQueue,
+    decoder: &mut Decoder,
+    want_keyframe: &AtomicBool,
+    au: TimedAu,
+    at: Instant,
+) -> bool {
+    let frame_len = clock.with_mut(|clock| clock.frame_duration());
+    let lead = decode_lead(frame_len);
+    let decode_at = at.checked_sub(lead).unwrap_or(at);
+    if !buffer.sleep_until(decode_at) {
+        return false;
+    }
+    let frame = match decode_to_rgba(decoder, &au.data) {
+        Ok(Some(frame)) => frame,
+        Ok(None) => return true,
+        Err(e) => {
+            tracing::debug!("{e}");
+            want_keyframe.store(true, Ordering::Relaxed);
+            return false;
+        }
+    };
+    if !buffer.sleep_until(at) {
+        return false;
+    }
+    match enqueue_frame(queue, frame, buffer, at) {
+        Enqueue::Queued(shown) => {
+            // A frame that is only a little late stays on the RTP grid. Stamping
+            // the actual time every frame would add that lateness again and
+            // the delay would grow until we started skipping.
+            let late = shown.saturating_duration_since(at);
+            let stamp = if late > frame_len / 2 { shown } else { at };
+            clock.with_mut(|clock| clock.did_show(stamp));
+            true
+        }
+        Enqueue::Skipped => {
+            // The UI is still busy and we are already a second behind. Keep the
+            // picture it has; the next step skips until the buffer fits again.
+            clock.with_mut(|clock| clock.did_show(Instant::now()));
+            true
+        }
+        Enqueue::Closed => false,
+    }
+}
+
+fn decode_lead(frame: Duration) -> Duration {
+    (frame * 2).clamp(Duration::from_millis(8), Duration::from_millis(50))
+}
+
+enum Enqueue {
+    Queued(Instant),
+    Skipped,
+    Closed,
+}
+
+fn enqueue_frame(
+    queue: &VideoFrameQueue,
+    frame: RgbaFrame,
+    buffer: &AuBuffer,
+    planned: Instant,
+) -> Enqueue {
+    let mut frame = Some(frame);
+    let deadline = planned + MAX_PLAYOUT_DELAY;
+    loop {
+        if buffer.is_closed() {
+            return Enqueue::Closed;
+        }
+        let Some(pending) = frame.take() else {
+            return Enqueue::Skipped;
+        };
+        match queue.try_push(pending) {
+            Ok(()) => return Enqueue::Queued(Instant::now()),
+            Err(returned) => {
+                frame = Some(returned);
+                if buffer.span() > MAX_PLAYOUT_DELAY || Instant::now() >= deadline {
+                    return Enqueue::Skipped;
+                }
+                let pause = Instant::now() + Duration::from_millis(4);
+                if !buffer.sleep_until(pause) {
+                    return Enqueue::Closed;
+                }
             }
         }
     }
@@ -181,5 +396,21 @@ mod tests {
         assert!(contains_idr(&[0, 0, 0, 1, 0x67, 1, 0, 0, 1, 0x65, 9]));
         assert!(!contains_idr(&[0, 0, 0, 1, 0x41, 1, 2, 3]));
         assert!(!contains_idr(&[]));
+    }
+
+    #[test]
+    fn decode_lead_stays_inside_one_frame_budget() {
+        assert_eq!(
+            decode_lead(Duration::from_millis(16)),
+            Duration::from_millis(32)
+        );
+        assert_eq!(
+            decode_lead(Duration::from_millis(8)),
+            Duration::from_millis(16)
+        );
+        assert_eq!(
+            decode_lead(Duration::from_millis(100)),
+            Duration::from_millis(50)
+        );
     }
 }
