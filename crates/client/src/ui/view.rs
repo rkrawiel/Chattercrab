@@ -36,13 +36,7 @@ pub(super) fn view(app: &App) -> Element<'_, Message> {
     let body = match &app.state.screen {
         Screen::Connect { connecting } => connect_view(app, *connecting),
         Screen::Lobby(lobby) => lobby_view(lobby, theme),
-        Screen::Room(room) => room_view(
-            room,
-            app.config.noise_suppression,
-            app.config.input_gain,
-            app.share_fullscreen,
-            theme,
-        ),
+        Screen::Room(room) => room_view(app, room),
     };
     let mut page = Column::new().push(container(body).height(Length::Fill));
     if let Some(notice) = &app.state.notice {
@@ -118,18 +112,23 @@ fn device_options(names: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Pick list options and the label of the chosen device (`None` is the system default).
+/// A device missing from a listed set is labelled as not found; the label is not an
+/// option, so it cannot be picked again.
+fn device_choice(names: &[String], selected: Option<&str>) -> (Vec<String>, String) {
+    let label = match selected {
+        None => SYSTEM_DEFAULT.to_owned(),
+        Some(name) if names.is_empty() || names.iter().any(|n| n == name) => name.to_owned(),
+        Some(name) => format!("{name} (not found)"),
+    };
+    (device_options(names), label)
+}
+
 fn connect_view(app: &App, connecting: bool) -> Element<'_, Message> {
     let config = &app.config;
-    let inputs = device_options(&app.state.inputs);
-    let outputs = device_options(&app.state.outputs);
-    let selected_input = config
-        .input_device
-        .clone()
-        .unwrap_or_else(|| SYSTEM_DEFAULT.to_owned());
-    let selected_output = config
-        .output_device
-        .clone()
-        .unwrap_or_else(|| SYSTEM_DEFAULT.to_owned());
+    let (inputs, selected_input) = device_choice(&app.state.inputs, config.input_device.as_deref());
+    let (outputs, selected_output) =
+        device_choice(&app.state.outputs, config.output_device.as_deref());
 
     let connect = action(
         if connecting {
@@ -626,9 +625,72 @@ fn share_picker(picker: &SharePicker) -> Element<'_, Message> {
         .into()
 }
 
-fn bottom_bar(room: &RoomScreen, noise_suppression: bool, input_gain: f32) -> Element<'_, Message> {
+fn device_pick(
+    options: Vec<String>,
+    selected: String,
+    on_select: fn(String) -> Message,
+) -> Element<'static, Message> {
+    pick_list(options, Some(selected), on_select)
+        .width(Length::Fill)
+        .padding(FIELD_PADDING)
+        .style(style::pick)
+        .menu_style(style::menu)
+        .into()
+}
+
+/// Replaces the bottom bar like the share picker: devices and mic volume.
+fn audio_panel(app: &App) -> Element<'_, Message> {
+    let config = &app.config;
+    let (inputs, input) = device_choice(&app.state.inputs, config.input_device.as_deref());
+    let (outputs, output) = device_choice(&app.state.outputs, config.output_device.as_deref());
+    let title = row![
+        text("Audio settings")
+            .size(15)
+            .font(style::SEMIBOLD)
+            .width(Length::Fill),
+        action("Refresh devices", style::ghost_button).on_press(Message::RefreshDevices),
+        action("Close", style::secondary_button).on_press(Message::CloseAudioPanel),
+    ]
+    .spacing(SPACING)
+    .align_y(Alignment::Center);
+    let devices = row![
+        labeled(
+            "Microphone",
+            device_pick(inputs, input, Message::InputSelected)
+        ),
+        labeled(
+            "Speakers",
+            device_pick(outputs, output, Message::OutputSelected)
+        ),
+    ]
+    .spacing(SPACING * 2);
+    let mic = labeled("Mic volume", mic_gain_control(config.input_gain));
+    container(
+        column![
+            title,
+            devices,
+            mic,
+            checkbox(config.noise_suppression)
+                .label("Noise suppression (removes background noise, keeps voice)")
+                .size(16)
+                .text_size(14)
+                .style(style::check)
+                .on_toggle(Message::NoiseSuppression),
+        ]
+        .spacing(SPACING + 4),
+    )
+    .padding(14)
+    .width(Length::Fill)
+    .style(style::card)
+    .into()
+}
+
+fn bottom_bar<'a>(app: &'a App, room: &'a RoomScreen) -> Element<'a, Message> {
     if let Some(picker) = &room.picker {
         return share_picker(picker);
+    }
+    if room.audio_panel {
+        return audio_panel(app);
     }
     let model = &room.model;
     let share = if model.local_sharing {
@@ -660,15 +722,16 @@ fn bottom_bar(room: &RoomScreen, noise_suppression: bool, input_gain: f32) -> El
         share,
         space().width(SPACING),
         small_label("Mic"),
-        container(mic_gain_control(input_gain)).max_width(200),
+        container(mic_gain_control(app.config.input_gain)).max_width(200),
         space().width(SPACING),
-        checkbox(noise_suppression)
+        checkbox(app.config.noise_suppression)
             .label("Noise suppression")
             .size(16)
             .text_size(14)
             .style(style::check)
             .on_toggle(Message::NoiseSuppression),
         space().width(Length::Fill),
+        action("Audio", style::secondary_button).on_press(Message::OpenAudioPanel),
         action("Leave", style::danger_button).on_press(Message::Leave),
     ]
     .spacing(SPACING)
@@ -699,15 +762,9 @@ fn share_stage(room: &RoomScreen) -> Element<'_, Message> {
     .into()
 }
 
-fn room_view(
-    room: &RoomScreen,
-    noise_suppression: bool,
-    input_gain: f32,
-    fullscreen: bool,
-    theme: ThemeChoice,
-) -> Element<'_, Message> {
+fn room_view<'a>(app: &'a App, room: &'a RoomScreen) -> Element<'a, Message> {
     let model = &room.model;
-    if fullscreen && model.remote_share_active() {
+    if app.share_fullscreen && model.remote_share_active() {
         return column![
             container(share_stage(room))
                 .width(Length::Fill)
@@ -753,7 +810,7 @@ fn room_view(
             action("Fullscreen", style::ghost_button).on_press(Message::ToggleShareFullscreen),
         );
     }
-    header = header.push(theme_toggle(theme));
+    header = header.push(theme_toggle(app.config.theme));
 
     let center: Element<'_, Message> = if model.remote_share_active() {
         row![
@@ -773,9 +830,28 @@ fn room_view(
         row![members_panel(room), center]
             .spacing(SPACING + 4)
             .height(Length::Fill),
-        bottom_bar(room, noise_suppression, input_gain),
+        bottom_bar(app, room),
     ]
     .spacing(SPACING + 4)
     .padding(PADDING)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_device_stays_visible_but_is_not_offered() {
+        let names = vec!["Mic A".to_owned()];
+        let (options, label) = device_choice(&names, Some("Mic A"));
+        assert_eq!(options, [SYSTEM_DEFAULT, "Mic A"]);
+        assert_eq!(label, "Mic A");
+        assert_eq!(device_choice(&names, None).1, SYSTEM_DEFAULT);
+        let (options, label) = device_choice(&names, Some("Mic B"));
+        assert_eq!(label, "Mic B (not found)");
+        assert!(!options.contains(&label));
+        // Not listed yet: no claim that it is missing.
+        assert_eq!(device_choice(&[], Some("Mic B")).1, "Mic B");
+    }
 }

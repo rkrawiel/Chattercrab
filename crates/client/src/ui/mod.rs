@@ -95,6 +95,8 @@ pub struct RoomScreen {
     pub chat_input: String,
     /// Open share picker, if any.
     pub picker: Option<SharePicker>,
+    /// The audio settings panel replaces the bottom bar. Never open together with `picker`.
+    pub audio_panel: bool,
     /// Newest remote screen picture, filled by the video subscription and drawn
     /// by the share view. Pictures never pass through [`App::update`].
     pub share_frame: LatestFrame,
@@ -149,6 +151,10 @@ pub enum Message {
     InputGainReleased,
     /// Re-list audio devices.
     RefreshDevices,
+    /// Open the audio settings panel in a room.
+    OpenAudioPanel,
+    /// Close the audio settings panel.
+    CloseAudioPanel,
     /// Connect button.
     Connect,
     /// Back to the connect screen.
@@ -360,9 +366,18 @@ impl App {
             Message::DisplayNameChanged(name) => self.config.display_name = name,
             Message::InputSelected(name) => {
                 self.config.input_device = (name != SYSTEM_DEFAULT).then_some(name);
+                self.save_config();
+                // Switched live once the engine runs; otherwise passed on connect.
+                if !matches!(self.state.screen, Screen::Connect { .. }) {
+                    self.send(UiCommand::SelectInput(self.config.input_device.clone()));
+                }
             }
             Message::OutputSelected(name) => {
                 self.config.output_device = (name != SYSTEM_DEFAULT).then_some(name);
+                self.save_config();
+                if !matches!(self.state.screen, Screen::Connect { .. }) {
+                    self.send(UiCommand::SelectOutput(self.config.output_device.clone()));
+                }
             }
             Message::ToggleTheme => {
                 self.config.theme = match self.config.theme {
@@ -388,6 +403,18 @@ impl App {
             }
             Message::InputGainReleased => self.save_config(),
             Message::RefreshDevices => self.send(UiCommand::ListDevices),
+            Message::OpenAudioPanel => {
+                if let Some(room) = self.room_mut() {
+                    room.picker = None;
+                    room.audio_panel = true;
+                    self.send(UiCommand::ListDevices);
+                }
+            }
+            Message::CloseAudioPanel => {
+                if let Some(room) = self.room_mut() {
+                    room.audio_panel = false;
+                }
+            }
             Message::Connect => self.connect(),
             Message::Disconnect => {
                 self.pending_enter = None;
@@ -482,6 +509,7 @@ impl App {
                 let include_audio = self.config.share_audio;
                 let content = self.config.screen_content;
                 if let Some(room) = self.room_mut() {
+                    room.audio_panel = false;
                     room.picker = Some(SharePicker {
                         sources: Vec::new(),
                         selected: None,
@@ -665,6 +693,7 @@ impl App {
             model: RoomModel::joining(id, name, self.config.display_name.clone()),
             chat_input: String::new(),
             picker: None,
+            audio_panel: false,
             share_frame: LatestFrame::default(),
         }));
     }
@@ -943,6 +972,67 @@ mod tests {
         assert_eq!(picker.fps, 120);
         assert_eq!(picker.scale, ScreenScale::P4K);
         assert_eq!(picker.content, ScreenContent::Desktop);
+    }
+
+    fn in_room(app: &mut App) {
+        app.enter_room(RoomId::new("room1").unwrap(), RoomName::new("1").unwrap());
+    }
+
+    #[test]
+    fn selecting_a_device_in_a_room_switches_it_live() {
+        let (mut app, mut rx) = app_with_backend(8);
+        assert!(matches!(rx.try_recv(), Ok(UiCommand::ListDevices)));
+        in_room(&mut app);
+        let _ = app.update(Message::InputSelected("USB mic".into()));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UiCommand::SelectInput(Some(name))) if name == "USB mic"
+        ));
+        let _ = app.update(Message::OutputSelected("Headset".into()));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(UiCommand::SelectOutput(Some(name))) if name == "Headset"
+        ));
+        assert_eq!(app.config.input_device.as_deref(), Some("USB mic"));
+        assert_eq!(app.config.output_device.as_deref(), Some("Headset"));
+        // The system default is sent as `None`.
+        let _ = app.update(Message::InputSelected(SYSTEM_DEFAULT.into()));
+        let _ = app.update(Message::OutputSelected(SYSTEM_DEFAULT.into()));
+        assert!(matches!(rx.try_recv(), Ok(UiCommand::SelectInput(None))));
+        assert!(matches!(rx.try_recv(), Ok(UiCommand::SelectOutput(None))));
+        assert_eq!(app.config.input_device, None);
+        assert_eq!(app.config.output_device, None);
+    }
+
+    #[test]
+    fn selecting_a_device_on_the_connect_screen_only_changes_the_config() {
+        let (mut app, mut rx) = app_with_backend(8);
+        assert!(matches!(rx.try_recv(), Ok(UiCommand::ListDevices)));
+        let _ = app.update(Message::InputSelected("USB mic".into()));
+        let _ = app.update(Message::OutputSelected("Headset".into()));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.config.input_device.as_deref(), Some("USB mic"));
+        assert_eq!(app.config.output_device.as_deref(), Some("Headset"));
+    }
+
+    #[test]
+    fn audio_panel_and_share_picker_are_exclusive() {
+        let (mut app, mut rx) = app_with_backend(8);
+        assert!(matches!(rx.try_recv(), Ok(UiCommand::ListDevices)));
+        in_room(&mut app);
+        let _ = app.update(Message::OpenAudioPanel);
+        // Opening the panel refreshes the device lists.
+        assert!(matches!(rx.try_recv(), Ok(UiCommand::ListDevices)));
+        let _ = app.update(Message::OpenSharePicker);
+        let room = app.room_mut().unwrap();
+        assert!(!room.audio_panel);
+        assert!(room.picker.is_some());
+        let _ = app.update(Message::OpenAudioPanel);
+        let room = app.room_mut().unwrap();
+        assert!(room.audio_panel);
+        assert!(room.picker.is_none());
+        let _ = app.update(Message::CloseAudioPanel);
+        assert!(!app.room_mut().unwrap().audio_panel);
     }
 
     #[test]

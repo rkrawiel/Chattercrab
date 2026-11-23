@@ -260,6 +260,9 @@ impl Backend {
             UiCommand::SetInputGain(gain) => {
                 self.media(MediaCommand::SetInputGain(gain)).await;
             }
+            // The engine reopens the device in a room and only records it otherwise.
+            UiCommand::SelectInput(name) => self.media(MediaCommand::SelectInput(name)).await,
+            UiCommand::SelectOutput(name) => self.media(MediaCommand::SelectOutput(name)).await,
             UiCommand::SetPeerVolume { peer, volume } => {
                 self.media(MediaCommand::SetPeerVolume { peer, volume })
                     .await;
