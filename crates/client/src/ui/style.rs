@@ -354,3 +354,29 @@ pub fn avatar(theme: &Theme, fill: Color, radius: f32, speaking: bool) -> contai
         .color(Color::WHITE)
         .border(border::rounded(radius).width(2).color(ring))
 }
+
+/// Loudness band of a level meter segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeterZone {
+    /// Normal speech.
+    Normal,
+    /// Loud.
+    Loud,
+    /// Close to clipping.
+    Hot,
+}
+
+/// One segment of the microphone level meter: green, yellow or red when lit, a dim
+/// rail color when not.
+pub fn meter_segment(theme: &Theme, zone: MeterZone, lit: bool) -> container::Style {
+    let palette = theme.palette();
+    let fill = match (lit, zone) {
+        (false, _) => alpha(palette.text, 0.12),
+        (true, MeterZone::Normal) => palette.success,
+        (true, MeterZone::Loud) => palette.warning,
+        (true, MeterZone::Hot) => palette.danger,
+    };
+    container::Style::default()
+        .background(fill)
+        .border(border::rounded(2))
+}

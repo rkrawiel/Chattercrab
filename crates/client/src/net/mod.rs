@@ -69,6 +69,10 @@ pub enum UiCommand {
     SetNoiseSuppression(bool),
     /// Microphone gain (`1.0` unity, `5.0` is 500%).
     SetInputGain(f32),
+    /// Switch the microphone; `None` = system default. Reopened at once while in a room.
+    SelectInput(Option<String>),
+    /// Switch the speakers; `None` = system default. Reopened at once while in a room.
+    SelectOutput(Option<String>),
     /// Playback volume for one peer (0.0 to 5.0).
     SetPeerVolume {
         /// Remote peer.
@@ -142,6 +146,11 @@ impl std::fmt::Debug for UiCommand {
             Self::SetInputGain(gain) => f
                 .debug_tuple("UiCommand::SetInputGain")
                 .field(gain)
+                .finish(),
+            Self::SelectInput(name) => f.debug_tuple("UiCommand::SelectInput").field(name).finish(),
+            Self::SelectOutput(name) => f
+                .debug_tuple("UiCommand::SelectOutput")
+                .field(name)
                 .finish(),
             Self::SetPeerVolume { peer, volume } => f
                 .debug_struct("UiCommand::SetPeerVolume")
