@@ -3,6 +3,7 @@
 //! `update` never blocks: every side effect is a [`UiCommand`] sent with `try_send`
 //! to the backend running on its own Tokio runtime thread.
 
+mod meter;
 pub mod room_model;
 mod selectable;
 mod share_view;

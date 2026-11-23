@@ -8,10 +8,10 @@ use iced::widget::{
 };
 use iced::{Alignment, Element, Length, Padding, Theme};
 
-use super::room_model::MemberView;
+use super::room_model::{MemberView, RoomModel};
 use super::share_view::ShareView;
 use super::{
-    App, Lobby, Message, RoomScreen, SYSTEM_DEFAULT, Screen, SharePicker, selectable, style,
+    App, Lobby, Message, RoomScreen, SYSTEM_DEFAULT, Screen, SharePicker, meter, selectable, style,
 };
 use crate::config::ThemeChoice;
 
@@ -28,6 +28,8 @@ const SCALE_CHOICES: [ScreenScale; 4] = [
 ];
 /// Field padding shared by text inputs and pick lists.
 const FIELD_PADDING: [u16; 2] = [9, 12];
+/// Width of the percentage next to a volume slider.
+const PERCENT_WIDTH: u32 = 36;
 
 type ButtonStyle = fn(&Theme, button::Status) -> button::Style;
 
@@ -285,7 +287,7 @@ fn mic_gain_control(gain: f32) -> Element<'static, Message> {
 fn percent(value: f32) -> Element<'static, Message> {
     text(format!("{}%", (value * 100.0).round() as u32))
         .size(12)
-        .width(36)
+        .width(PERCENT_WIDTH)
         .align_x(Alignment::End)
         .style(style::muted)
         .into()
@@ -625,6 +627,11 @@ fn share_picker(picker: &SharePicker) -> Element<'_, Message> {
         .into()
 }
 
+/// Our microphone level for the meter; empty while muted.
+fn mic_level(model: &RoomModel) -> f32 {
+    if model.muted { 0.0 } else { model.local_level }
+}
+
 fn device_pick(
     options: Vec<String>,
     selected: String,
@@ -638,8 +645,8 @@ fn device_pick(
         .into()
 }
 
-/// Replaces the bottom bar like the share picker: devices and mic volume.
-fn audio_panel(app: &App) -> Element<'_, Message> {
+/// Replaces the bottom bar like the share picker: devices, mic volume and level.
+fn audio_panel<'a>(app: &'a App, room: &'a RoomScreen) -> Element<'a, Message> {
     let config = &app.config;
     let (inputs, input) = device_choice(&app.state.inputs, config.input_device.as_deref());
     let (outputs, output) = device_choice(&app.state.outputs, config.output_device.as_deref());
@@ -664,7 +671,16 @@ fn audio_panel(app: &App) -> Element<'_, Message> {
         ),
     ]
     .spacing(SPACING * 2);
-    let mic = labeled("Mic volume", mic_gain_control(config.input_gain));
+    let mic = row![
+        labeled("Mic volume", mic_gain_control(config.input_gain)),
+        labeled(
+            "Mic level",
+            container(meter::level_meter(mic_level(&room.model), 10.0, 3))
+                .padding([4, 0])
+                .into(),
+        ),
+    ]
+    .spacing(SPACING * 2);
     container(
         column![
             title,
@@ -690,7 +706,7 @@ fn bottom_bar<'a>(app: &'a App, room: &'a RoomScreen) -> Element<'a, Message> {
         return share_picker(picker);
     }
     if room.audio_panel {
-        return audio_panel(app);
+        return audio_panel(app, room);
     }
     let model = &room.model;
     let share = if model.local_sharing {
@@ -722,7 +738,16 @@ fn bottom_bar<'a>(app: &'a App, room: &'a RoomScreen) -> Element<'a, Message> {
         share,
         space().width(SPACING),
         small_label("Mic"),
-        container(mic_gain_control(app.config.input_gain)).max_width(200),
+        // The level meter sits under the slider rail, clear of the percentage.
+        container(
+            column![
+                mic_gain_control(app.config.input_gain),
+                container(meter::level_meter(mic_level(model), 5.0, 2))
+                    .padding(Padding::ZERO.right(PERCENT_WIDTH + SPACING)),
+            ]
+            .spacing(4)
+        )
+        .max_width(200),
         space().width(SPACING),
         checkbox(app.config.noise_suppression)
             .label("Noise suppression")
