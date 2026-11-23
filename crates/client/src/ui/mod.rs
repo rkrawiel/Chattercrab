@@ -3,6 +3,7 @@
 //! `update` never blocks: every side effect is a [`UiCommand`] sent with `try_send`
 //! to the backend running on its own Tokio runtime thread.
 
+mod links;
 pub mod room_model;
 mod selectable;
 mod share_view;
@@ -199,6 +200,8 @@ pub enum Message {
     PeerMuteToggled(PeerId, bool),
     /// Clear the status line.
     DismissNotice,
+    /// A link in the chat was clicked: open it in the browser.
+    OpenLink(String),
 }
 
 /// Which room the UI is waiting to open. A `welcome` that arrives after Leave
@@ -604,6 +607,11 @@ impl App {
                 self.push_peer_volume(peer);
             }
             Message::DismissNotice => self.state.notice = None,
+            Message::OpenLink(url) => {
+                if let Err(e) = links::open(&url) {
+                    self.state.notice = Some(format!("Could not open the link: {e}"));
+                }
+            }
         }
         followup
     }

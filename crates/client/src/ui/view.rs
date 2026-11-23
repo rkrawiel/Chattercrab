@@ -480,7 +480,7 @@ fn members_panel(room: &RoomScreen) -> Element<'_, Message> {
     .into()
 }
 
-fn chat_panel(room: &RoomScreen) -> Element<'_, Message> {
+fn chat_panel(room: &RoomScreen, theme: ThemeChoice) -> Element<'_, Message> {
     let model = &room.model;
     let log: Element<'_, Message> = if model.chat.is_empty() {
         container(
@@ -494,11 +494,21 @@ fn chat_panel(room: &RoomScreen) -> Element<'_, Message> {
         // Positional on purpose: iced 0.14's keyed column re-matches every existing row
         // when a line is appended (see `CHAT_TRIM_BATCH` for the trim side).
         let mut log = Column::new().spacing(SPACING + 4).width(Length::Fill);
+        let link_color = match theme {
+            ThemeChoice::Dark => &style::DARK,
+            ThemeChoice::Light => &style::LIGHT,
+        }
+        .extended_palette()
+        .primary
+        .base
+        .color;
         for msg in &model.chat {
             log = log.push(selectable::message(
                 msg.id,
                 msg.display_name.as_str(),
                 msg.text.as_str(),
+                link_color,
+                Message::OpenLink,
             ));
         }
         scrollable(log)
@@ -760,12 +770,12 @@ fn room_view(
             container(share_stage(room))
                 .width(Length::FillPortion(3))
                 .height(Length::Fill),
-            container(chat_panel(room)).width(Length::Fixed(300.0)),
+            container(chat_panel(room, theme)).width(Length::Fixed(300.0)),
         ]
         .spacing(SPACING + 4)
         .into()
     } else {
-        chat_panel(room)
+        chat_panel(room, theme)
     };
 
     column![
