@@ -4,6 +4,7 @@ Changes to the public contract in `src/lib.rs` relative to the stub committed in
 `e2cb69c` ("define media engine API contract with stub engine"). Rows above the ICE change are additive.
 
 | Change | Kind | Notes |
+| `MediaCommand::PlayCue(Cue)` + `Cue { Join, Leave, Message }` | new variant, new enum | Plays a short synthesized notification sound through the selected output device. The mixer adds it after the deafen gate, so it plays while deafened. Dropped (not queued) when no output is open, that is outside a room. A new cue replaces one still playing. `MediaConfig` is unchanged. |
 | `Nv12Frame.seq: u64` + `Nv12Frame::next_seq()` | new field | Unique increasing picture number set by every producer. Plane buffers may be pooled and reuse an address, so consumers must detect a new picture by `seq`, not by `Arc` pointer. |
 | `RgbaFrame` replaced by `Nv12Frame` | breaking | The screen queue now carries NV12 planes. The client draws them with a shader instead of uploading RGBA through the image widget. |
 | `ScreenPublisher.bitrate_bps` | new field | Encoder target for the share that just started. |
