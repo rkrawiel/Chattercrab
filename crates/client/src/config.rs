@@ -1,6 +1,7 @@
 //! Persistent client configuration (`chattercrab/config.toml` in the platform config
 //! directory). Chat history is never stored.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -61,6 +62,8 @@ pub struct Config {
     pub high_quality: bool,
     /// Desktop (crisp fonts) or game (less blur). Independent of size and frame rate.
     pub screen_content: ScreenContent,
+    /// How often each emoji was sent from the picker; the most used show first.
+    pub emoji_usage: BTreeMap<String, u32>,
 }
 
 fn default_input_gain() -> f32 {
@@ -84,6 +87,7 @@ impl Default for Config {
             share_audio: false,
             high_quality: false,
             screen_content: ScreenContent::Desktop,
+            emoji_usage: BTreeMap::new(),
         }
     }
 }
@@ -206,6 +210,7 @@ impl std::fmt::Debug for Config {
             .field("share_audio", &self.share_audio)
             .field("high_quality", &self.high_quality)
             .field("screen_content", &self.screen_content)
+            .field("emoji_usage", &self.emoji_usage)
             .finish()
     }
 }
@@ -247,6 +252,7 @@ mod tests {
             share_audio: true,
             high_quality: true,
             screen_content: ScreenContent::Game,
+            emoji_usage: BTreeMap::from([("💩".to_owned(), 3)]),
         };
         config.save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();

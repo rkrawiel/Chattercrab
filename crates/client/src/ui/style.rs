@@ -114,6 +114,28 @@ pub fn floating(theme: &Theme) -> container::Style {
     }
 }
 
+/// A menu floating over a card (emoji picker, suggestions): one step off the card, with a
+/// stronger border and a shadow so it stands out.
+pub fn popup(theme: &Theme) -> container::Style {
+    container::Style {
+        shadow: Shadow {
+            color: alpha(Color::BLACK, if is_dark(theme) { 0.5 } else { 0.16 }),
+            offset: Vector::new(0.0, 4.0),
+            blur_radius: 16.0,
+        },
+        ..container::Style::default().background(inset(theme)).border(
+            border::rounded(RADIUS_LG)
+                .width(1)
+                .color(alpha(theme.palette().text, 0.22)),
+        )
+    }
+}
+
+/// A one pixel separator line.
+pub fn divider(theme: &Theme) -> container::Style {
+    container::Style::default().background(alpha(theme.palette().text, 0.16))
+}
+
 fn filled(background: Color, text_color: Color, status: button::Status) -> button::Style {
     let background = match status {
         button::Status::Hovered => Color {

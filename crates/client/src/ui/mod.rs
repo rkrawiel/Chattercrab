@@ -3,6 +3,10 @@
 //! `update` never blocks: every side effect is a [`UiCommand`] sent with `try_send`
 //! to the backend running on its own Tokio runtime thread.
 
+mod emoji;
+
+/// Widget id of the emoji picker's search box, focused when the picker opens.
+pub const EMOJI_SEARCH_ID: &str = "emoji-search";
 mod links;
 pub mod meter;
 pub mod room_model;
@@ -95,6 +99,10 @@ pub struct RoomScreen {
     pub model: RoomModel,
     /// Chat input text.
     pub chat_input: String,
+    /// The emoji picker is open above the chat input.
+    pub emoji_open: bool,
+    /// Text in the emoji picker's search box.
+    pub emoji_query: String,
     /// Open share picker, if any.
     pub picker: Option<SharePicker>,
     /// The audio settings panel replaces the bottom bar. Never open together with `picker`.
@@ -173,6 +181,16 @@ pub enum Message {
     ChatChanged(String),
     /// Enter in the chat input.
     SendChat,
+    /// Show or hide the emoji picker.
+    ToggleEmojiPicker,
+    /// Close the emoji picker (click elsewhere, Escape, typing or sending).
+    CloseEmojiPicker,
+    /// Text of the emoji picker's search box changed.
+    EmojiSearchChanged(String),
+    /// Emoji picked: appended to the chat input.
+    InsertEmoji(&'static str),
+    /// Emoji picked from the `:word` suggestions: replaces the typed `:word`.
+    CompleteEmoji(&'static str),
     /// Toggle microphone mute (button or Ctrl+M).
     ToggleMute,
     /// Toggle deafen (button or Ctrl+D).
@@ -336,6 +354,12 @@ impl App {
         }
     }
 
+    /// Counts a picked emoji towards the picker's most-used list.
+    fn count_emoji(&mut self, emoji: &str) {
+        *self.config.emoji_usage.entry(emoji.to_owned()).or_insert(0) += 1;
+        self.save_config();
+    }
+
     fn room_mut(&mut self) -> Option<&mut RoomScreen> {
         match &mut self.state.screen {
             Screen::Room(room) => Some(room),
@@ -360,6 +384,9 @@ impl App {
                 }
             }
             Message::ExitShareFullscreen => {
+                if let Some(room) = self.room_mut() {
+                    room.emoji_open = false;
+                }
                 if self.share_fullscreen {
                     followup = self.set_share_fullscreen(false);
                 }
@@ -455,9 +482,48 @@ impl App {
             Message::ChatChanged(text) => {
                 if let Some(room) = self.room_mut() {
                     room.chat_input = text;
+                    room.emoji_open = false;
+                }
+            }
+            Message::ToggleEmojiPicker => {
+                if let Some(room) = self.room_mut() {
+                    room.emoji_open = !room.emoji_open;
+                    room.emoji_query.clear();
+                    if room.emoji_open {
+                        followup = iced::widget::operation::focus(EMOJI_SEARCH_ID);
+                    }
+                }
+            }
+            Message::EmojiSearchChanged(query) => {
+                if let Some(room) = self.room_mut() {
+                    room.emoji_query = query;
+                }
+            }
+            Message::CloseEmojiPicker => {
+                if let Some(room) = self.room_mut() {
+                    room.emoji_open = false;
+                }
+            }
+            Message::InsertEmoji(emoji) => {
+                if let Some(room) = self.room_mut() {
+                    room.chat_input.push_str(emoji);
+                    room.emoji_open = false;
+                    self.count_emoji(emoji);
+                }
+            }
+            Message::CompleteEmoji(emoji) => {
+                if let Some(room) = self.room_mut() {
+                    if let Some((colon, _)) = emoji::pending_query(&room.chat_input) {
+                        room.chat_input.truncate(colon);
+                    }
+                    room.chat_input.push_str(emoji);
+                    self.count_emoji(emoji);
                 }
             }
             Message::SendChat => {
+                if let Some(room) = self.room_mut() {
+                    room.emoji_open = false;
+                }
                 let text = self
                     .room_mut()
                     .map(|room| std::mem::take(&mut room.chat_input));
@@ -701,6 +767,8 @@ impl App {
         self.state.screen = Screen::Room(Box::new(RoomScreen {
             model: RoomModel::joining(id, name, self.config.display_name.clone()),
             chat_input: String::new(),
+            emoji_open: false,
+            emoji_query: String::new(),
             picker: None,
             audio_panel: false,
             share_frame: LatestFrame::default(),

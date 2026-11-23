@@ -3,15 +3,17 @@
 use chattercrab_media::{PEER_VOLUME_MAX, PeerConnectionState, ScreenContent, ScreenScale};
 use iced::widget::shader::Shader;
 use iced::widget::{
-    Button, Column, TextInput, button, checkbox, column, container, pick_list, row, scrollable,
-    slider, space, stack, text, text_input, tooltip,
+    Button, Column, TextInput, button, checkbox, column, container, mouse_area, pick_list, row,
+    scrollable, slider, space, stack, text, text_input, tooltip,
 };
 use iced::{Alignment, Element, Length, Padding, Theme};
+use std::collections::BTreeMap;
 
 use super::room_model::{MemberView, RoomModel};
 use super::share_view::ShareView;
 use super::{
-    App, Lobby, Message, RoomScreen, SYSTEM_DEFAULT, Screen, SharePicker, meter, selectable, style,
+    App, Lobby, Message, RoomScreen, SYSTEM_DEFAULT, Screen, SharePicker, emoji, meter, selectable,
+    style,
 };
 use crate::config::ThemeChoice;
 
@@ -481,7 +483,11 @@ fn members_panel(room: &RoomScreen) -> Element<'_, Message> {
     .into()
 }
 
-fn chat_panel(room: &RoomScreen, theme: ThemeChoice) -> Element<'_, Message> {
+fn chat_panel<'a>(
+    room: &'a RoomScreen,
+    theme: ThemeChoice,
+    usage: &BTreeMap<String, u32>,
+) -> Element<'a, Message> {
     let model = &room.model;
     let log: Element<'_, Message> = if model.chat.is_empty() {
         container(
@@ -523,15 +529,156 @@ fn chat_panel(room: &RoomScreen, theme: ThemeChoice) -> Element<'_, Message> {
     let input = input("Message (Enter to send)", &room.chat_input)
         .on_input(Message::ChatChanged)
         .on_submit(Message::SendChat);
-    container(
-        column![log, input]
-            .spacing(SPACING + 4)
-            .height(Length::Fill),
+    let emoji_toggle = tooltip(
+        button(text("😀").size(16).center())
+            .width(36)
+            .height(36)
+            .padding(0)
+            .style(style::icon_button)
+            .on_press(Message::ToggleEmojiPicker),
+        container(text("Emoji").size(12))
+            .padding([4, 8])
+            .style(style::floating),
+        tooltip::Position::Top,
+    );
+    let send_button = tooltip(
+        button(text("➤").size(16).center())
+            .width(36)
+            .height(36)
+            .padding(0)
+            .style(style::primary_button)
+            .on_press_maybe((!room.chat_input.trim().is_empty()).then_some(Message::SendChat)),
+        container(text("Send").size(12))
+            .padding([4, 8])
+            .style(style::floating),
+        tooltip::Position::Top,
+    );
+    let input_row = row![input, emoji_toggle, send_button]
+        .spacing(SPACING)
+        .align_y(Alignment::Center);
+    let mut panel = Column::new()
+        .push(mouse_area(log).on_press(Message::CloseEmojiPicker))
+        .spacing(SPACING + 4)
+        .height(Length::Fill);
+    if room.emoji_open {
+        panel = panel.push(
+            container(emoji_picker(&room.emoji_query, usage))
+                .width(Length::Fill)
+                .align_x(Alignment::End),
+        );
+    } else if let Some(suggestions) = emoji_suggestions(&room.chat_input) {
+        panel = panel.push(container(suggestions).width(Length::Fill));
+    }
+    container(panel.push(input_row))
+        .padding(14)
+        .height(Length::Fill)
+        .style(style::card)
+        .into()
+}
+
+/// Number of emoji per row in the picker.
+const EMOJI_PER_ROW: usize = 8;
+
+/// Width of the emoji picker and suggestion popups.
+const EMOJI_PICKER_WIDTH: f32 = 360.0;
+
+fn emoji_grid<'a>(
+    mut list: Column<'a, Message>,
+    emoji: impl Iterator<Item = &'static str>,
+) -> Column<'a, Message> {
+    let emoji: Vec<&'static str> = emoji.collect();
+    for chunk in emoji.chunks(EMOJI_PER_ROW) {
+        list = list.push(
+            row(chunk.iter().map(|&e| {
+                button(text(e).size(20).center())
+                    .width(38)
+                    .height(38)
+                    .padding(0)
+                    .style(style::icon_button)
+                    .on_press(Message::InsertEmoji(e))
+                    .into()
+            }))
+            .spacing(2),
+        );
+    }
+    list
+}
+
+fn emoji_picker<'a>(query: &str, usage: &BTreeMap<String, u32>) -> Element<'a, Message> {
+    let search = input("Search emoji", query)
+        .id(super::EMOJI_SEARCH_ID)
+        .on_input(Message::EmojiSearchChanged);
+    let mut list = Column::new().spacing(4).padding([0, 8]);
+    if query.trim().is_empty() {
+        let top = emoji::top(usage);
+        let mut sections: Vec<(String, Vec<&'static str>)> = Vec::new();
+        if !top.is_empty() {
+            sections.push(("🕘 Most used".to_owned(), top));
+        }
+        sections.extend(
+            emoji::CATEGORIES
+                .iter()
+                .map(|c| (format!("{} {}", c.icon, c.name), c.emoji.to_vec())),
+        );
+        for (i, (title, emoji)) in sections.into_iter().enumerate() {
+            if i > 0 {
+                list = list.push(
+                    container(space())
+                        .width(Length::Fill)
+                        .height(1)
+                        .style(style::divider),
+                );
+            }
+            list = list.push(text(title).size(12).style(style::muted));
+            list = emoji_grid(list, emoji.into_iter());
+        }
+    } else {
+        let hits = emoji::search(query, emoji::MAX_RESULTS);
+        if hits.is_empty() {
+            list = list.push(text("No emoji found").size(13).style(style::muted));
+        } else {
+            list = emoji_grid(list, hits.into_iter().map(|e| e.as_str()));
+        }
+    }
+    let body = column![
+        search,
+        scrollable(list)
+            .style(style::scroll)
+            .width(Length::Fill)
+            .height(Length::Fixed(220.0))
+    ]
+    .spacing(SPACING);
+    container(body)
+        .padding(10)
+        .width(Length::Fixed(EMOJI_PICKER_WIDTH))
+        .style(style::popup)
+        .into()
+}
+
+/// `:word` suggestions above the chat input.
+fn emoji_suggestions<'a>(chat_input: &str) -> Option<Element<'a, Message>> {
+    let (_, word) = emoji::pending_query(chat_input)?;
+    let hits = emoji::search(word, 6);
+    if hits.is_empty() {
+        return None;
+    }
+    let rows = Column::with_children(hits.into_iter().map(|e| {
+        let label = format!("{}  :{}:", e.as_str(), e.shortcode().unwrap_or(e.name()));
+        button(text(label).size(15))
+            .width(Length::Fill)
+            .padding([4, 8])
+            .style(style::icon_button)
+            .on_press(Message::CompleteEmoji(e.as_str()))
+            .into()
+    }))
+    .spacing(2);
+    Some(
+        container(rows)
+            .padding(6)
+            .width(Length::Fixed(EMOJI_PICKER_WIDTH))
+            .style(style::popup)
+            .into(),
     )
-    .padding(14)
-    .height(Length::Fill)
-    .style(style::card)
-    .into()
 }
 
 fn small_label(label: &str) -> Element<'_, Message> {
@@ -852,12 +999,13 @@ fn room_view<'a>(app: &'a App, room: &'a RoomScreen) -> Element<'a, Message> {
             container(share_stage(room))
                 .width(Length::FillPortion(3))
                 .height(Length::Fill),
-            container(chat_panel(room, app.config.theme)).width(Length::Fixed(300.0)),
+            container(chat_panel(room, app.config.theme, &app.config.emoji_usage))
+                .width(Length::Fixed(300.0)),
         ]
         .spacing(SPACING + 4)
         .into()
     } else {
-        chat_panel(room, app.config.theme)
+        chat_panel(room, app.config.theme, &app.config.emoji_usage)
     };
 
     column![
