@@ -4,7 +4,7 @@
 //! to the backend running on its own Tokio runtime thread.
 
 mod links;
-mod meter;
+pub mod meter;
 pub mod room_model;
 mod selectable;
 mod share_view;

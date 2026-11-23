@@ -54,9 +54,10 @@ pub struct Session {
     /// Last `welcome`, kept current so joining the same room again can refresh
     /// the UI without dropping the socket (which would delete a one-person room).
     joined: Option<JoinedRoom>,
-    /// Who was speaking (local, peers) in the last levels forwarded to the UI. The UI
-    /// only shows speaking dots, so levels that flip nobody are not forwarded.
-    speaking: Option<(bool, BTreeSet<PeerId>)>,
+    /// What the UI shows for the last levels forwarded to it: lit meter segments for
+    /// our microphone, whether we speak, and the speaking peers. Levels that change
+    /// none of these are not forwarded.
+    speaking: Option<(usize, bool, BTreeSet<PeerId>)>,
 }
 
 impl Session {
@@ -306,6 +307,7 @@ impl Session {
             }
             MediaEvent::Levels { local, peers } => {
                 let speaking = (
+                    crate::ui::meter::lit_segments(local),
                     local >= SPEAKING_THRESHOLD,
                     peers
                         .iter()
@@ -588,12 +590,16 @@ mod tests {
     }
 
     #[test]
-    fn levels_are_forwarded_only_when_someone_starts_or_stops_speaking() {
+    fn levels_are_forwarded_only_when_the_display_changes() {
         let quiet = SPEAKING_THRESHOLD / 2.0;
         let loud = SPEAKING_THRESHOLD * 2.0;
         let mut s = session();
         assert!(levels(&mut s, 0.0, &[(2, quiet)]));
-        // Level changes on the same side of the threshold are dropped.
+        // The microphone meter must fall back to empty when the sound stops.
+        assert!(levels(&mut s, quiet, &[(2, 0.0)]));
+        assert!(levels(&mut s, 0.0, &[(2, 0.0)]));
+        assert!(levels(&mut s, quiet, &[(2, 0.0)]));
+        // Same meter segments and speaking state are dropped.
         assert!(!levels(&mut s, quiet, &[(2, 0.0)]));
         assert!(levels(&mut s, quiet, &[(2, loud)]));
         assert!(!levels(&mut s, quiet, &[(2, loud * 2.0)]));
