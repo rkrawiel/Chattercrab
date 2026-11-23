@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chattercrab_media::{
-    MediaCommand, MediaEvent, OutgoingSignal, ScreenContent, ScreenScale, ScreenSource,
+    Cue, MediaCommand, MediaEvent, OutgoingSignal, ScreenContent, ScreenScale, ScreenSource,
 };
 use chattercrab_protocol::{
     CHAT_HISTORY_LEN, ClientMsg, DisplayName, ErrorCode, IceServers, PeerId, PeerInfo, RoomId,
@@ -133,10 +133,15 @@ impl Session {
                     screen_publisher,
                 };
                 self.joined = Some(joined.clone());
-                let mut effects = vec![Effect::Media(MediaCommand::Configure {
-                    me: you,
-                    ice: self.ice.clone(),
-                })];
+                // One join cue for entering, not one per peer already present. It
+                // follows `Configure`, which opens the output device.
+                let mut effects = vec![
+                    Effect::Media(MediaCommand::Configure {
+                        me: you,
+                        ice: self.ice.clone(),
+                    }),
+                    Effect::Media(MediaCommand::PlayCue(Cue::Join)),
+                ];
                 // The newcomer offers to everyone already present.
                 effects.extend(peers.iter().map(|p| {
                     Effect::Media(MediaCommand::AddPeer {
@@ -148,32 +153,40 @@ impl Session {
                 effects
             }
             ServerMsg::PeerJoined { peer } => {
-                self.peers.insert(peer.id, peer.clone());
+                let new = self.peers.insert(peer.id, peer.clone()).is_none();
                 if let Some(joined) = &mut self.joined
                     && !joined.peers.iter().any(|p| p.id == peer.id)
                 {
                     joined.peers.push(peer.clone());
                 }
-                vec![
+                let mut effects = vec![
                     Effect::Media(MediaCommand::AddPeer {
                         peer: peer.id,
                         initiate: false,
                     }),
                     Effect::Ui(AppEvent::PeerJoined(peer)),
-                ]
+                ];
+                if new {
+                    effects.push(Effect::Media(MediaCommand::PlayCue(Cue::Join)));
+                }
+                effects
             }
             ServerMsg::PeerLeft { peer_id } => {
-                self.peers.remove(&peer_id);
+                let known = self.peers.remove(&peer_id).is_some();
                 if let Some(joined) = &mut self.joined {
                     joined.peers.retain(|p| p.id != peer_id);
                     if joined.screen_publisher == Some(peer_id) {
                         joined.screen_publisher = None;
                     }
                 }
-                vec![
+                let mut effects = vec![
                     Effect::Media(MediaCommand::RemovePeer { peer: peer_id }),
                     Effect::Ui(AppEvent::PeerLeft(peer_id)),
-                ]
+                ];
+                if known {
+                    effects.push(Effect::Media(MediaCommand::PlayCue(Cue::Leave)));
+                }
+                effects
             }
             ServerMsg::Offer { from, sdp } => {
                 vec![Effect::Media(MediaCommand::RemoteOffer { from, sdp })]
@@ -198,7 +211,14 @@ impl Session {
                     let excess = joined.history.len().saturating_sub(CHAT_HISTORY_LEN);
                     joined.history.drain(..excess);
                 }
-                vec![Effect::Ui(AppEvent::Chat(msg))]
+                // Only for others' messages, not our own echo. History arrives in
+                // `welcome`, so it never gets here.
+                let from_other = self.me.is_some_and(|me| me != msg.from);
+                let mut effects = vec![Effect::Ui(AppEvent::Chat(msg))];
+                if from_other {
+                    effects.push(Effect::Media(MediaCommand::PlayCue(Cue::Message)));
+                }
+                effects
             }
             ServerMsg::ScreenGranted => match self.pending_share.take() {
                 Some(PendingShare {
@@ -434,14 +454,18 @@ mod tests {
         ));
         assert!(matches!(
             effects[1],
-            Effect::Media(MediaCommand::AddPeer { peer: p, initiate: true }) if p == peer(2)
+            Effect::Media(MediaCommand::PlayCue(Cue::Join))
         ));
         assert!(matches!(
             effects[2],
+            Effect::Media(MediaCommand::AddPeer { peer: p, initiate: true }) if p == peer(2)
+        ));
+        assert!(matches!(
+            effects[3],
             Effect::Media(MediaCommand::AddPeer { peer: p, initiate: true }) if p == peer(3)
         ));
-        assert!(matches!(&effects[3], Effect::Ui(AppEvent::Joined(j)) if j.peers.len() == 2));
-        assert_eq!(effects.len(), 4);
+        assert!(matches!(&effects[4], Effect::Ui(AppEvent::Joined(j)) if j.peers.len() == 2));
+        assert_eq!(effects.len(), 5);
         assert_eq!(s.me, Some(peer(1)));
     }
 
@@ -716,9 +740,72 @@ mod tests {
         // A new welcome rebuilds the mesh.
         let effects = welcome(&mut s, vec![info(3)]);
         assert!(matches!(
-            effects[1],
+            effects[2],
             Effect::Media(MediaCommand::AddPeer { peer: p, initiate: true }) if p == peer(3)
         ));
+    }
+
+    fn cues(effects: &[Effect]) -> Vec<Cue> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Media(MediaCommand::PlayCue(c)) => Some(*c),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn welcome_plays_one_join_cue_after_configure() {
+        let mut s = session();
+        let effects = s.on_server_msg(ServerMsg::Welcome {
+            you: peer(1),
+            peers: vec![info(2), info(3)],
+            history: vec![chat(1), chat(2)],
+            screen_publisher: None,
+        });
+        // One cue for us, none per peer present or per history message.
+        assert_eq!(cues(&effects), vec![Cue::Join]);
+        let configure = effects
+            .iter()
+            .position(|e| matches!(e, Effect::Media(MediaCommand::Configure { .. })));
+        let cue = effects
+            .iter()
+            .position(|e| matches!(e, Effect::Media(MediaCommand::PlayCue(_))));
+        assert!(configure.unwrap() < cue.unwrap());
+        // A rejoin after a reconnect is again a single cue.
+        s.on_disconnected();
+        assert_eq!(
+            cues(&welcome(&mut s, vec![info(2), info(3)])),
+            vec![Cue::Join]
+        );
+    }
+
+    #[test]
+    fn peers_joining_and_leaving_play_cues() {
+        let mut s = session();
+        welcome(&mut s, vec![info(2)]);
+        let effects = s.on_server_msg(ServerMsg::PeerJoined { peer: info(3) });
+        assert_eq!(cues(&effects), vec![Cue::Join]);
+        let effects = s.on_server_msg(ServerMsg::PeerLeft { peer_id: peer(2) });
+        assert_eq!(cues(&effects), vec![Cue::Leave]);
+        // A peer we never knew leaving is silent.
+        let effects = s.on_server_msg(ServerMsg::PeerLeft { peer_id: peer(9) });
+        assert!(cues(&effects).is_empty());
+    }
+
+    #[test]
+    fn chat_cue_only_for_messages_from_others() {
+        let mut s = session();
+        welcome(&mut s, vec![info(2)]);
+        let effects = s.on_server_msg(ServerMsg::Chat { msg: chat(1) });
+        assert_eq!(cues(&effects), vec![Cue::Message]);
+        let own = ChatMessage {
+            from: peer(1),
+            ..chat(2)
+        };
+        let effects = s.on_server_msg(ServerMsg::Chat { msg: own });
+        assert!(cues(&effects).is_empty());
     }
 
     #[test]

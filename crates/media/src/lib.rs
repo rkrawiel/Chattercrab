@@ -17,6 +17,7 @@
 //! own OS thread. See `crates/media/README.md`.
 
 pub mod audio;
+mod cue;
 pub mod denoise;
 mod engine;
 pub mod jitter;
@@ -230,6 +231,17 @@ pub enum OutgoingSignal {
     },
 }
 
+/// Short notification sound played through the selected output device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cue {
+    /// Someone joined the room (or we did): a rising two-note chime.
+    Join,
+    /// Someone left the room: the falling mirror of [`Cue::Join`].
+    Leave,
+    /// A chat message from someone else arrived: a high double blip.
+    Message,
+}
+
 /// Commands accepted by the engine.
 #[derive(Debug, Clone)]
 pub enum MediaCommand {
@@ -321,6 +333,9 @@ pub enum MediaCommand {
     },
     /// Stop publishing the screen share.
     StopScreenShare,
+    /// Play a notification sound, also while deafened. Dropped when no output device is
+    /// open (outside a room), not queued.
+    PlayCue(Cue),
     /// Stop everything and close the event channel.
     Shutdown,
 }

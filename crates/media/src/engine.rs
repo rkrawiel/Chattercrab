@@ -312,6 +312,10 @@ impl Engine {
                     .await;
             }
             MediaCommand::StopScreenShare => self.stop_screen().await,
+            // The mixer drops it when no output is open.
+            MediaCommand::PlayCue(cue) => {
+                let _ = self.mixer.send(MixerControl::PlayCue(cue));
+            }
             // Handled by the run loop.
             MediaCommand::Shutdown => {}
         }

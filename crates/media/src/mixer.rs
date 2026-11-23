@@ -3,10 +3,12 @@
 //! A dedicated thread (promoted to real-time priority where the OS allows) pulls one
 //! 20 ms frame per remote peer from that peer's [`JitterBuffer`], decodes it with the
 //! peer's Opus decoder (normal, FEC or PLC), applies the peer volume, sums into `i32`,
-//! runs a soft-knee limiter, converts to `i16` and writes the frame to the playback
-//! ring. Pacing follows the playback ring fill level, so the output device clock drives
-//! the mixer. Without an output device the mixer paces itself on a 20 ms timer, and with
-//! neither a device nor peers it blocks on the control channel.
+//! adds the notification cue that is playing (if any), runs a soft-knee limiter,
+//! converts to `i16` and writes the frame to the playback ring. The cue is added after
+//! the deafen gate, so it plays while deafened. Pacing follows the playback ring fill
+//! level, so the output device clock drives the mixer. Without an output device the
+//! mixer paces itself on a 20 ms timer, and with neither a device nor peers it blocks on
+//! the control channel.
 //!
 //! Everything the loop touches is allocated before the loop: peer slots arrive fully
 //! constructed through the control channel and the slot vector has fixed capacity.
@@ -21,9 +23,9 @@ use chattercrab_protocol::PeerId;
 use ringbuf::traits::{Consumer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 
-use crate::MediaError;
 use crate::audio::{FRAME_SAMPLES, OutputSink, new_opus_decoder, rms_i16};
 use crate::jitter::{JitterBuffer, MAX_PACKET, Playout};
+use crate::{Cue, MediaError};
 
 /// Maximum number of simultaneously mixed peers (design target is 4 remote peers).
 pub const MAX_PEERS: usize = 8;
@@ -187,12 +189,14 @@ pub fn soft_limit(x: i32) -> i16 {
     if x < 0 { -y } else { y }
 }
 
-/// Sums `inputs` (pcm, Q12 gain) into `acc`, then limits into `out`.
+/// Sums `inputs` (pcm, Q12 gain) and `cue` into `acc`, then limits into `out`.
 ///
-/// When `deafened` is set the output is silence regardless of the inputs.
+/// When `deafened` is set the inputs are ignored, but `cue` still plays. `cue` may be
+/// shorter than a frame (or empty); the rest of the frame gets no cue.
 pub fn mix_frames<'a>(
     inputs: impl Iterator<Item = (&'a [i16; FRAME_SAMPLES], i32)>,
     deafened: bool,
+    cue: &[i16],
     acc: &mut [i32; FRAME_SAMPLES],
     out: &mut [i16; FRAME_SAMPLES],
 ) {
@@ -206,6 +210,9 @@ pub fn mix_frames<'a>(
                 *a += (i32::from(s) * gain) >> 12;
             }
         }
+    }
+    for (a, &s) in acc.iter_mut().zip(cue.iter()) {
+        *a += i32::from(s);
     }
     for (o, &a) in out.iter_mut().zip(acc.iter()) {
         *o = soft_limit(a);
@@ -227,6 +234,10 @@ pub struct MixerCore {
     acc: Box<[i32; FRAME_SAMPLES]>,
     out: Box<[i16; FRAME_SAMPLES]>,
     deafened: Arc<AtomicBool>,
+    /// Rendered samples per [`Cue`], indexed by `cue as usize`.
+    cues: [Box<[i16]>; 3],
+    /// Cue playing and the position of its next sample.
+    cue: Option<(Cue, usize)>,
 }
 
 impl MixerCore {
@@ -237,7 +248,20 @@ impl MixerCore {
             acc: Box::new([0; FRAME_SAMPLES]),
             out: Box::new([0; FRAME_SAMPLES]),
             deafened,
+            cues: [Cue::Join, Cue::Leave, Cue::Message]
+                .map(|c| crate::cue::render(c).into_boxed_slice()),
+            cue: None,
         }
+    }
+
+    /// Starts playing `cue` from its first sample, replacing a cue still playing.
+    pub fn play_cue(&mut self, cue: Cue) {
+        self.cue = Some((cue, 0));
+    }
+
+    /// Stops the cue playing, if any.
+    pub fn stop_cue(&mut self) {
+        self.cue = None;
     }
 
     /// Adds (or replaces) a peer slot. Returns the slot back if the mixer is full.
@@ -274,12 +298,24 @@ impl MixerCore {
             slot.produce_frame();
         }
         let deafened = self.deafened.load(Ordering::Relaxed);
+        let cue: &[i16] = match self.cue {
+            Some((c, pos)) => {
+                let samples = &self.cues[c as usize];
+                &samples[pos..samples.len().min(pos + FRAME_SAMPLES)]
+            }
+            None => &[],
+        };
         mix_frames(
             self.slots.iter().map(|s| (&s.pcm, gain_q12(&s.controls))),
             deafened,
+            cue,
             &mut self.acc,
             &mut self.out,
         );
+        if let Some((c, pos)) = self.cue {
+            let next = pos + FRAME_SAMPLES;
+            self.cue = (next < self.cues[c as usize].len()).then_some((c, next));
+        }
         &self.out
     }
 }
@@ -292,6 +328,8 @@ pub enum MixerControl {
     RemovePeer(PeerId),
     /// Replace the playback sink (`None` = no device, self-paced).
     SetOutput(Option<Box<OutputSink>>),
+    /// Play a notification cue, also while deafened. Dropped without a playback sink.
+    PlayCue(Cue),
     /// Exit the thread.
     Shutdown,
 }
@@ -382,7 +420,18 @@ fn apply(core: &mut MixerCore, output: &mut Option<Box<OutputSink>>, msg: MixerC
             }
         }
         MixerControl::RemovePeer(peer) => core.remove(peer),
-        MixerControl::SetOutput(sink) => *output = sink,
+        MixerControl::SetOutput(sink) => {
+            if sink.is_none() {
+                core.stop_cue();
+            }
+            *output = sink;
+        }
+        // Cues are only for the speaker: without one they are dropped, not queued.
+        MixerControl::PlayCue(cue) => {
+            if output.is_some() {
+                core.play_cue(cue);
+            }
+        }
         MixerControl::Shutdown => return false,
     }
     true
@@ -521,6 +570,7 @@ mod tests {
         mix_frames(
             [(&a, GAIN_ONE), (&b, GAIN_ONE), (&c, GAIN_ONE)].into_iter(),
             false,
+            &[],
             &mut acc,
             &mut out,
         );
@@ -535,11 +585,12 @@ mod tests {
         mix_frames(
             [(&z, GAIN_ONE), (&z, GAIN_ONE)].into_iter(),
             false,
+            &[],
             &mut acc,
             &mut out,
         );
         assert!(out.iter().all(|&s| s == 0));
-        mix_frames(std::iter::empty(), false, &mut acc, &mut out);
+        mix_frames(std::iter::empty(), false, &[], &mut acc, &mut out);
         assert!(out.iter().all(|&s| s == 0));
     }
 
@@ -566,10 +617,22 @@ mod tests {
         let a = frame(30_000);
         let mut acc = [0; FRAME_SAMPLES];
         let mut out = [0; FRAME_SAMPLES];
-        mix_frames([(&a, GAIN_ONE); 4].into_iter(), false, &mut acc, &mut out);
+        mix_frames(
+            [(&a, GAIN_ONE); 4].into_iter(),
+            false,
+            &[],
+            &mut acc,
+            &mut out,
+        );
         assert!(out.iter().all(|&s| s > 30_000));
         let n = frame(-30_000);
-        mix_frames([(&n, GAIN_ONE); 4].into_iter(), false, &mut acc, &mut out);
+        mix_frames(
+            [(&n, GAIN_ONE); 4].into_iter(),
+            false,
+            &[],
+            &mut acc,
+            &mut out,
+        );
         assert!(out.iter().all(|&s| s < -30_000));
     }
 
@@ -578,11 +641,23 @@ mod tests {
         let a = frame(1000);
         let mut acc = [0; FRAME_SAMPLES];
         let mut out = [0; FRAME_SAMPLES];
-        mix_frames([(&a, GAIN_ONE / 2)].into_iter(), false, &mut acc, &mut out);
+        mix_frames(
+            [(&a, GAIN_ONE / 2)].into_iter(),
+            false,
+            &[],
+            &mut acc,
+            &mut out,
+        );
         assert!(out.iter().all(|&s| s == 500));
-        mix_frames([(&a, GAIN_ONE * 2)].into_iter(), false, &mut acc, &mut out);
+        mix_frames(
+            [(&a, GAIN_ONE * 2)].into_iter(),
+            false,
+            &[],
+            &mut acc,
+            &mut out,
+        );
         assert!(out.iter().all(|&s| s == 2000));
-        mix_frames([(&a, 0)].into_iter(), false, &mut acc, &mut out);
+        mix_frames([(&a, 0)].into_iter(), false, &[], &mut acc, &mut out);
         assert!(out.iter().all(|&s| s == 0));
     }
 
@@ -591,8 +666,68 @@ mod tests {
         let a = frame(5000);
         let mut acc = [0; FRAME_SAMPLES];
         let mut out = [0; FRAME_SAMPLES];
-        mix_frames([(&a, GAIN_ONE)].into_iter(), true, &mut acc, &mut out);
+        mix_frames([(&a, GAIN_ONE)].into_iter(), true, &[], &mut acc, &mut out);
         assert!(out.iter().all(|&s| s == 0));
+    }
+
+    #[test]
+    fn deafen_keeps_the_cue() {
+        let a = frame(5000);
+        let cue = [100i16; 10];
+        let mut acc = [0; FRAME_SAMPLES];
+        let mut out = [0; FRAME_SAMPLES];
+        mix_frames([(&a, GAIN_ONE)].into_iter(), true, &cue, &mut acc, &mut out);
+        assert!(out[..10].iter().all(|&s| s == 100));
+        assert!(out[10..].iter().all(|&s| s == 0));
+        mix_frames(
+            [(&a, GAIN_ONE)].into_iter(),
+            false,
+            &cue,
+            &mut acc,
+            &mut out,
+        );
+        assert!(out[..10].iter().all(|&s| s == 5100));
+        assert!(out[10..].iter().all(|&s| s == 5000));
+    }
+
+    #[test]
+    fn core_plays_a_cue_once_while_deafened() {
+        let mut core = MixerCore::new(Arc::new(AtomicBool::new(true)));
+        let expected = crate::cue::render(Cue::Leave);
+        core.play_cue(Cue::Leave);
+        let frames = expected.len().div_ceil(FRAME_SAMPLES);
+        let mut played = Vec::new();
+        for _ in 0..frames + 2 {
+            played.extend_from_slice(core.tick());
+        }
+        // Below the limiter knee the cue passes unchanged, then silence.
+        assert_eq!(&played[..expected.len()], &expected[..]);
+        assert!(played[expected.len()..].iter().all(|&s| s == 0));
+    }
+
+    #[test]
+    fn cues_need_an_output() {
+        let mut core = MixerCore::new(Arc::new(AtomicBool::new(false)));
+        let mut output = None;
+        assert!(apply(
+            &mut core,
+            &mut output,
+            MixerControl::PlayCue(Cue::Join)
+        ));
+        assert!(core.tick().iter().all(|&s| s == 0));
+
+        let (prod, _cons) = HeapRb::<f32>::new(4 * FRAME_SAMPLES).split();
+        let sink = OutputSink::new(prod, crate::audio::SAMPLE_RATE).unwrap();
+        apply(
+            &mut core,
+            &mut output,
+            MixerControl::SetOutput(Some(Box::new(sink))),
+        );
+        apply(&mut core, &mut output, MixerControl::PlayCue(Cue::Message));
+        assert!(rms_i16(core.tick()) > 0.01);
+        // Closing the output stops the cue instead of resuming it on the next device.
+        apply(&mut core, &mut output, MixerControl::SetOutput(None));
+        assert!(core.tick().iter().all(|&s| s == 0));
     }
 
     #[test]
