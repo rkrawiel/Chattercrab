@@ -226,8 +226,9 @@ Superseded by ADR-504.
 
 * Decision: the capture source is opened on the capture thread because `xcap` handles are
   not `Send` on Windows; `ScreenPublisher::start` waits for the open result over a channel.
-  OpenH264 is built from source by `openh264-sys2` (no nasm needed; assembly is skipped if
-  nasm is absent).
+  OpenH264 is built from source by `openh264-sys2`. Assembly is skipped if nasm is absent,
+  which makes decoding about 50% slower, so `crates/media/build.rs` warns about it. Linux
+  viewers decode every screen share with OpenH264.
 * Consequences: on Linux, `xcap` links `libxcb`, `libpipewire-0.3`, `libdbus` (via zbus,
   pure Rust) and needs `libclang` at build time for the PipeWire bindings. Wayland capture
   goes through the desktop portal and is best effort; X11 is the supported path.
