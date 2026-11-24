@@ -64,6 +64,55 @@ pub struct Config {
     pub screen_content: ScreenContent,
     /// How often each emoji was sent from the picker; the most used show first.
     pub emoji_usage: BTreeMap<String, u32>,
+    /// Follow the operating system's light or dark setting instead of [`Self::theme`].
+    /// Installs from before this setting keep their chosen theme.
+    #[serde(default)]
+    pub follow_system_theme: bool,
+    /// Interface size factor, one of [`UI_SCALES`].
+    #[serde(default = "default_ui_scale")]
+    pub ui_scale: f32,
+    /// The microphone is open only while [`Self::ptt_key`] is held.
+    pub push_to_talk: bool,
+    /// Name of the push-to-talk key, one of [`PTT_KEYS`].
+    #[serde(default = "default_ptt_key")]
+    pub ptt_key: String,
+}
+
+/// Interface size steps (1.0 is 100%).
+pub const UI_SCALES: [f32; 7] = [0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75];
+
+/// Keys that can be used for push-to-talk.
+pub const PTT_KEYS: [&str; 5] = ["F8", "F9", "F10", "F11", "`"];
+
+fn default_ui_scale() -> f32 {
+    1.0
+}
+
+fn default_ptt_key() -> String {
+    "F9".to_owned()
+}
+
+/// The closest allowed size step to `scale`.
+pub fn nearest_ui_scale(scale: f32) -> f32 {
+    UI_SCALES
+        .iter()
+        .copied()
+        .min_by(|a, b| (a - scale).abs().total_cmp(&(b - scale).abs()))
+        .unwrap_or(1.0)
+}
+
+/// The size step `direction` steps (-1 smaller, +1 larger) away from `scale`, or `scale`
+/// itself at the ends of [`UI_SCALES`].
+pub fn step_ui_scale(scale: f32, direction: i32) -> f32 {
+    let current = nearest_ui_scale(scale);
+    let index = UI_SCALES
+        .iter()
+        .position(|s| (*s - current).abs() < f32::EPSILON)
+        .unwrap_or(2);
+    let next = index
+        .saturating_add_signed(direction as isize)
+        .min(UI_SCALES.len() - 1);
+    UI_SCALES[next]
 }
 
 fn default_input_gain() -> f32 {
@@ -88,6 +137,10 @@ impl Default for Config {
             high_quality: false,
             screen_content: ScreenContent::Desktop,
             emoji_usage: BTreeMap::new(),
+            follow_system_theme: true,
+            ui_scale: default_ui_scale(),
+            push_to_talk: false,
+            ptt_key: default_ptt_key(),
         }
     }
 }
@@ -112,6 +165,10 @@ impl Config {
             .screen_fps
             .clamp(*SCREEN_FPS_RANGE.start(), *SCREEN_FPS_RANGE.end());
         config.input_gain = clamp_input_gain(config.input_gain);
+        config.ui_scale = nearest_ui_scale(config.ui_scale);
+        if !PTT_KEYS.contains(&config.ptt_key.as_str()) {
+            config.ptt_key = default_ptt_key();
+        }
         // The previous default was full capture at 15 fps. That pair now means 1440p60.
         if config.screen_fps == 15 && legacy_screen_scale(&text) {
             config.screen_fps = DEFAULT_SCREEN_FPS;
@@ -211,6 +268,10 @@ impl std::fmt::Debug for Config {
             .field("high_quality", &self.high_quality)
             .field("screen_content", &self.screen_content)
             .field("emoji_usage", &self.emoji_usage)
+            .field("follow_system_theme", &self.follow_system_theme)
+            .field("ui_scale", &self.ui_scale)
+            .field("push_to_talk", &self.push_to_talk)
+            .field("ptt_key", &self.ptt_key)
             .finish()
     }
 }
@@ -253,6 +314,10 @@ mod tests {
             high_quality: true,
             screen_content: ScreenContent::Game,
             emoji_usage: BTreeMap::from([("💩".to_owned(), 3)]),
+            follow_system_theme: false,
+            ui_scale: 1.25,
+            push_to_talk: true,
+            ptt_key: "F10".into(),
         };
         config.save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
@@ -268,6 +333,31 @@ mod tests {
         );
         assert!(rendered.contains("<redacted>"), "{rendered}");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn old_files_keep_their_theme_and_bad_values_are_repaired() {
+        let dir = temp_dir("accessibility");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "theme = \"light\"\n").unwrap();
+        let config = Config::load(&path).unwrap();
+        assert!(!config.follow_system_theme);
+        assert_eq!(config.ui_scale, 1.0);
+        assert!(Config::default().follow_system_theme);
+        std::fs::write(&path, "ui_scale = 7.0\nptt_key = \"Enter\"\n").unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.ui_scale, 1.75);
+        assert_eq!(config.ptt_key, "F9");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ui_scale_steps_stop_at_the_ends() {
+        assert_eq!(step_ui_scale(1.0, 1), 1.1);
+        assert_eq!(step_ui_scale(1.0, -1), 0.9);
+        assert_eq!(step_ui_scale(1.75, 1), 1.75);
+        assert_eq!(step_ui_scale(0.8, -1), 0.8);
+        assert_eq!(step_ui_scale(1.12, 1), 1.25);
     }
 
     #[test]

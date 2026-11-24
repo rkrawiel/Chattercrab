@@ -7,6 +7,22 @@ mod emoji;
 
 /// Widget id of the emoji picker's search box, focused when the picker opens.
 pub const EMOJI_SEARCH_ID: &str = "emoji-search";
+/// Id of the chat message field, so it can be refocused after sending or picking an emoji.
+pub const CHAT_INPUT_ID: &str = "chat-input";
+
+/// Keys that steer the `:word` suggestions (and Tab between fields otherwise).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuggestKey {
+    Up,
+    Down,
+    Tab,
+    BackTab,
+}
+
+fn focus_chat_input() -> Task<Message> {
+    iced::widget::operation::focus(CHAT_INPUT_ID)
+        .chain(iced::widget::operation::move_cursor_to_end(CHAT_INPUT_ID))
+}
 mod links;
 pub mod meter;
 pub mod room_model;
@@ -88,6 +104,19 @@ impl std::fmt::Display for SourceOption {
     }
 }
 
+/// The push-to-talk key name (one of [`crate::config::PTT_KEYS`]) for a key, if it is one.
+fn ptt_name(key: keyboard::Key<&str>) -> Option<&'static str> {
+    use keyboard::key::Named;
+    match key {
+        keyboard::Key::Named(Named::F8) => Some("F8"),
+        keyboard::Key::Named(Named::F9) => Some("F9"),
+        keyboard::Key::Named(Named::F10) => Some("F10"),
+        keyboard::Key::Named(Named::F11) => Some("F11"),
+        keyboard::Key::Character("`") => Some("`"),
+        _ => None,
+    }
+}
+
 fn clear_share_frame(room: &mut RoomScreen) {
     room.share_frame.clear();
 }
@@ -101,8 +130,12 @@ pub struct RoomScreen {
     pub chat_input: String,
     /// The emoji picker is open above the chat input.
     pub emoji_open: bool,
-    /// Text in the emoji picker's search box.
+    /// Emoji picker search text.
     pub emoji_query: String,
+    /// Highlighted `:word` suggestion.
+    pub suggest_index: usize,
+    /// Escape closed the `:word` suggestions for the current text.
+    pub suggest_dismissed: bool,
     /// Open share picker, if any.
     pub picker: Option<SharePicker>,
     /// The audio settings panel replaces the bottom bar. Never open together with `picker`.
@@ -110,6 +143,18 @@ pub struct RoomScreen {
     /// Newest remote screen picture, filled by the video subscription and drawn
     /// by the share view. Pictures never pass through [`App::update`].
     pub share_frame: LatestFrame,
+}
+
+impl RoomScreen {
+    /// `:word` suggestions for the current input, empty when none apply.
+    pub fn suggestions(&self) -> Vec<&'static emojis::Emoji> {
+        if self.emoji_open || self.suggest_dismissed {
+            return Vec::new();
+        }
+        emoji::pending_query(&self.chat_input)
+            .map(|(_, word)| emoji::search(word, 6))
+            .unwrap_or_default()
+    }
 }
 
 /// Mutable UI state.
@@ -151,8 +196,20 @@ pub enum Message {
     InputSelected(String),
     /// Speakers chosen.
     OutputSelected(String),
-    /// Switch between the light and dark theme.
+    /// Cycle the theme: follow the system, light, dark.
     ToggleTheme,
+    /// The operating system's light or dark mode, at start and when it changes.
+    SystemTheme(iced::theme::Mode),
+    /// Step the interface size up or down (`0` resets it).
+    UiScaleStep(i32),
+    /// Push-to-talk turned on or off.
+    PushToTalk(bool),
+    /// Push-to-talk key chosen.
+    PttKeySelected(String),
+    /// A push-to-talk candidate key went down or up.
+    PttKeyEvent { name: &'static str, down: bool },
+    /// The window gained or lost focus.
+    WindowFocus(bool),
     /// Noise suppression toggled (connect screen or room bar).
     NoiseSuppression(bool),
     /// Microphone gain slider moved (`1.0` is 100%, `5.0` is 500%).
@@ -179,6 +236,8 @@ pub enum Message {
     JoinRoom(RoomId, RoomName),
     /// Chat input edited.
     ChatChanged(String),
+    /// Up, Down, Tab or Shift+Tab while typing a chat message.
+    SuggestKey(SuggestKey),
     /// Enter in the chat input.
     SendChat,
     /// Show or hide the emoji picker.
@@ -253,6 +312,10 @@ pub struct App {
     pending_enter: Option<PendingEnter>,
     /// The window is fullscreen for a remote share.
     share_fullscreen: bool,
+    /// Last light or dark mode reported by the operating system.
+    system_mode: iced::theme::Mode,
+    /// The push-to-talk key is currently held.
+    ptt_held: bool,
 }
 
 impl std::fmt::Debug for App {
@@ -311,9 +374,53 @@ impl App {
             config_writer,
             pending_enter: None,
             share_fullscreen: false,
+            system_mode: iced::theme::Mode::None,
+            ptt_held: false,
         };
         app.send(UiCommand::ListDevices);
         app
+    }
+
+    /// Asks the system for its current light or dark mode.
+    pub fn system_theme_task() -> Task<Message> {
+        iced::system::theme().map(Message::SystemTheme)
+    }
+
+    /// Interface scale factor for the window.
+    pub fn scale_factor(&self) -> f32 {
+        self.config.ui_scale
+    }
+
+    /// Whether the dark theme is showing.
+    pub fn is_dark(&self) -> bool {
+        if self.config.follow_system_theme {
+            self.system_mode != iced::theme::Mode::Light
+        } else {
+            self.config.theme == ThemeChoice::Dark
+        }
+    }
+
+    /// Releases a held push-to-talk key: the microphone goes quiet again.
+    fn ptt_release(&mut self) {
+        if self.ptt_held {
+            self.ptt_held = false;
+            self.set_muted(true);
+        }
+    }
+
+    fn set_muted(&mut self, muted: bool) {
+        if self
+            .room_mut()
+            .is_some_and(|room| room.model.muted != muted)
+        {
+            if self.try_send(UiCommand::SetMuted(muted)) {
+                if let Some(room) = self.room_mut() {
+                    room.model.muted = muted;
+                }
+            } else {
+                self.state.notice = Some("Could not change mute. Try again.".into());
+            }
+        }
     }
 
     /// Window title.
@@ -326,9 +433,10 @@ impl App {
 
     /// Light or dark theme.
     pub fn theme(&self) -> Theme {
-        match self.config.theme {
-            ThemeChoice::Light => style::LIGHT.clone(),
-            ThemeChoice::Dark => style::DARK.clone(),
+        if self.is_dark() {
+            style::DARK.clone()
+        } else {
+            style::LIGHT.clone()
         }
     }
 
@@ -367,6 +475,51 @@ impl App {
         }
     }
 
+    /// Replaces the pending `:word` with `emoji`.
+    fn complete_emoji(&mut self, emoji: &'static str) {
+        if let Some(room) = self.room_mut() {
+            if let Some((colon, _)) = emoji::pending_query(&room.chat_input) {
+                room.chat_input.truncate(colon);
+            }
+            room.chat_input.push_str(emoji);
+            room.suggest_index = 0;
+            self.count_emoji(emoji);
+        }
+    }
+
+    /// Takes the highlighted `:word` suggestion; the input keeps focus.
+    fn accept_suggestion(&mut self) -> Task<Message> {
+        let pick = self
+            .room_mut()
+            .and_then(|room| room.suggestions().get(room.suggest_index).copied())
+            .map(|e| e.as_str());
+        if let Some(emoji) = pick {
+            self.complete_emoji(emoji);
+        }
+        focus_chat_input()
+    }
+
+    fn send_chat(&mut self) {
+        if let Some(room) = self.room_mut() {
+            room.emoji_open = false;
+        }
+        let text = self
+            .room_mut()
+            .map(|room| std::mem::take(&mut room.chat_input));
+        if let Some(text) = text {
+            match chattercrab_protocol::validate_chat_text(&text) {
+                Ok(valid) => self.send(UiCommand::SendChat(valid.to_owned())),
+                Err(_) if text.trim().is_empty() => {}
+                Err(e) => {
+                    if let Some(room) = self.room_mut() {
+                        room.chat_input = text;
+                    }
+                    self.state.notice = Some(e.to_string());
+                }
+            }
+        }
+    }
+
     /// Elm update.
     pub fn update(&mut self, message: Message) -> Task<Message> {
         let mut followup = Task::none();
@@ -386,6 +539,7 @@ impl App {
             Message::ExitShareFullscreen => {
                 if let Some(room) = self.room_mut() {
                     room.emoji_open = false;
+                    room.suggest_dismissed = true;
                 }
                 if self.share_fullscreen {
                     followup = self.set_share_fullscreen(false);
@@ -411,11 +565,53 @@ impl App {
                 }
             }
             Message::ToggleTheme => {
-                self.config.theme = match self.config.theme {
-                    ThemeChoice::Dark => ThemeChoice::Light,
-                    ThemeChoice::Light => ThemeChoice::Dark,
+                // Auto -> Light -> Dark -> Auto.
+                if self.config.follow_system_theme {
+                    self.config.follow_system_theme = false;
+                    self.config.theme = ThemeChoice::Light;
+                } else if self.config.theme == ThemeChoice::Light {
+                    self.config.theme = ThemeChoice::Dark;
+                } else {
+                    self.config.follow_system_theme = true;
+                }
+                self.save_config();
+            }
+            Message::SystemTheme(mode) => self.system_mode = mode,
+            Message::UiScaleStep(direction) => {
+                self.config.ui_scale = if direction == 0 {
+                    1.0
+                } else {
+                    crate::config::step_ui_scale(self.config.ui_scale, direction)
                 };
                 self.save_config();
+            }
+            Message::PushToTalk(on) => {
+                self.config.push_to_talk = on;
+                self.ptt_held = false;
+                self.save_config();
+                // Quiet until the key is held; turning it off restores a live microphone.
+                self.set_muted(on);
+            }
+            Message::PttKeySelected(key) => {
+                if crate::config::PTT_KEYS.contains(&key.as_str()) {
+                    self.config.ptt_key = key;
+                    self.save_config();
+                }
+            }
+            Message::PttKeyEvent { name, down } => {
+                if self.config.push_to_talk
+                    && name == self.config.ptt_key
+                    && self.room_mut().is_some()
+                    && down != self.ptt_held
+                {
+                    self.ptt_held = down;
+                    self.set_muted(!down);
+                }
+            }
+            Message::WindowFocus(focused) => {
+                if !focused {
+                    self.ptt_release();
+                }
             }
             Message::NoiseSuppression(on) => {
                 self.config.noise_suppression = on;
@@ -483,6 +679,31 @@ impl App {
                 if let Some(room) = self.room_mut() {
                     room.chat_input = text;
                     room.emoji_open = false;
+                    room.suggest_index = 0;
+                    room.suggest_dismissed = false;
+                }
+            }
+            Message::SuggestKey(key) => {
+                let visible = self
+                    .room_mut()
+                    .map(|room| room.suggestions().len())
+                    .unwrap_or(0);
+                match key {
+                    SuggestKey::Up | SuggestKey::Down if visible > 0 => {
+                        if let Some(room) = self.room_mut() {
+                            room.suggest_index = if key == SuggestKey::Down {
+                                (room.suggest_index + 1) % visible
+                            } else {
+                                (room.suggest_index + visible - 1) % visible
+                            };
+                        }
+                    }
+                    SuggestKey::Tab if visible > 0 => {
+                        followup = self.accept_suggestion();
+                    }
+                    SuggestKey::Tab => followup = iced::widget::operation::focus_next(),
+                    SuggestKey::BackTab => followup = iced::widget::operation::focus_previous(),
+                    _ => {}
                 }
             }
             Message::ToggleEmojiPicker => {
@@ -509,35 +730,22 @@ impl App {
                     room.chat_input.push_str(emoji);
                     room.emoji_open = false;
                     self.count_emoji(emoji);
+                    followup = focus_chat_input();
                 }
             }
             Message::CompleteEmoji(emoji) => {
-                if let Some(room) = self.room_mut() {
-                    if let Some((colon, _)) = emoji::pending_query(&room.chat_input) {
-                        room.chat_input.truncate(colon);
-                    }
-                    room.chat_input.push_str(emoji);
-                    self.count_emoji(emoji);
-                }
+                self.complete_emoji(emoji);
+                followup = focus_chat_input();
             }
             Message::SendChat => {
-                if let Some(room) = self.room_mut() {
-                    room.emoji_open = false;
-                }
-                let text = self
+                if self
                     .room_mut()
-                    .map(|room| std::mem::take(&mut room.chat_input));
-                if let Some(text) = text {
-                    match chattercrab_protocol::validate_chat_text(&text) {
-                        Ok(valid) => self.send(UiCommand::SendChat(valid.to_owned())),
-                        Err(_) if text.trim().is_empty() => {}
-                        Err(e) => {
-                            if let Some(room) = self.room_mut() {
-                                room.chat_input = text;
-                            }
-                            self.state.notice = Some(e.to_string());
-                        }
-                    }
+                    .is_some_and(|room| !room.suggestions().is_empty())
+                {
+                    followup = self.accept_suggestion();
+                } else {
+                    self.send_chat();
+                    followup = focus_chat_input();
                 }
             }
             // The toggle only shows once the backend has the command, so the UI never
@@ -764,15 +972,21 @@ impl App {
 
     fn enter_room(&mut self, id: RoomId, name: RoomName) {
         self.state.notice = None;
+        self.ptt_held = false;
         self.state.screen = Screen::Room(Box::new(RoomScreen {
             model: RoomModel::joining(id, name, self.config.display_name.clone()),
             chat_input: String::new(),
+            suggest_index: 0,
+            suggest_dismissed: false,
             emoji_open: false,
             emoji_query: String::new(),
             picker: None,
             audio_panel: false,
             share_frame: LatestFrame::default(),
         }));
+        if self.config.push_to_talk {
+            self.set_muted(true);
+        }
     }
 
     fn on_backend(&mut self, event: AppEvent) {
@@ -869,10 +1083,38 @@ impl App {
             })
         });
         let keys = iced::event::listen_with(|event, _status, _window| match event {
-            iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+            iced::Event::Window(iced::window::Event::Focused) => Some(Message::WindowFocus(true)),
+            iced::Event::Window(iced::window::Event::Unfocused) => {
+                Some(Message::WindowFocus(false))
+            }
+            iced::Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) => {
+                ptt_name(key.as_ref()).map(|name| Message::PttKeyEvent { name, down: false })
+            }
+            iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                modifiers,
+                repeat,
+                ..
+            }) => {
+                if let Some(name) = ptt_name(key.as_ref()) {
+                    return (!repeat).then_some(Message::PttKeyEvent { name, down: true });
+                }
                 match key.as_ref() {
                     keyboard::Key::Named(keyboard::key::Named::Escape) => {
                         Some(Message::ExitShareFullscreen)
+                    }
+                    keyboard::Key::Named(keyboard::key::Named::ArrowUp) => {
+                        Some(Message::SuggestKey(SuggestKey::Up))
+                    }
+                    keyboard::Key::Named(keyboard::key::Named::ArrowDown) => {
+                        Some(Message::SuggestKey(SuggestKey::Down))
+                    }
+                    keyboard::Key::Named(keyboard::key::Named::Tab) => {
+                        Some(Message::SuggestKey(if modifiers.shift() {
+                            SuggestKey::BackTab
+                        } else {
+                            SuggestKey::Tab
+                        }))
                     }
                     keyboard::Key::Character("m") if modifiers.command() => {
                         Some(Message::ToggleMute)
@@ -880,12 +1122,22 @@ impl App {
                     keyboard::Key::Character("d") if modifiers.command() => {
                         Some(Message::ToggleDeafen)
                     }
+                    keyboard::Key::Character("=" | "+") if modifiers.command() => {
+                        Some(Message::UiScaleStep(1))
+                    }
+                    keyboard::Key::Character("-") if modifiers.command() => {
+                        Some(Message::UiScaleStep(-1))
+                    }
+                    keyboard::Key::Character("0") if modifiers.command() => {
+                        Some(Message::UiScaleStep(0))
+                    }
                     _ => None,
                 }
             }
             _ => None,
         });
-        let mut subs = vec![backend, keys];
+        let system_theme = iced::system::theme_changes().map(Message::SystemTheme);
+        let mut subs = vec![backend, keys, system_theme];
         if let (Screen::Room(room), Some(video)) = (&self.state.screen, &self.state.video)
             && room.model.remote_share_active()
         {
@@ -961,6 +1213,52 @@ mod tests {
         let _ = app.update(Message::ToggleDeafen);
         assert_eq!(muted(&app), (true, true));
         assert!(matches!(rx.try_recv(), Ok(UiCommand::SetDeafened(true))));
+    }
+
+    #[test]
+    fn push_to_talk_unmutes_only_while_the_key_is_held() {
+        let (mut app, _rx) = app_with_backend(16);
+        let _ = app.update(Message::PushToTalk(true));
+        app.enter_room(RoomId::new("room1").unwrap(), RoomName::new("1").unwrap());
+        assert!(muted(&app).0);
+        let key = |down| Message::PttKeyEvent { name: "F9", down };
+        let _ = app.update(key(true));
+        assert!(!muted(&app).0);
+        // A different key does nothing; losing focus releases the held key.
+        let _ = app.update(Message::PttKeyEvent {
+            name: "F8",
+            down: false,
+        });
+        assert!(!muted(&app).0);
+        let _ = app.update(Message::WindowFocus(false));
+        assert!(muted(&app).0);
+        let _ = app.update(key(true));
+        let _ = app.update(key(false));
+        assert!(muted(&app).0);
+    }
+
+    #[test]
+    fn colon_suggestions_are_steered_by_the_keyboard() {
+        let mut app = app();
+        app.enter_room(RoomId::new("room1").unwrap(), RoomName::new("1").unwrap());
+        let _ = app.update(Message::ChatChanged("hi :smile".into()));
+        let count = |app: &mut App| app.room_mut().unwrap().suggestions().len();
+        let n = count(&mut app);
+        assert!(n > 1);
+        let _ = app.update(Message::SuggestKey(SuggestKey::Up));
+        assert_eq!(app.room_mut().unwrap().suggest_index, n - 1);
+        let _ = app.update(Message::SuggestKey(SuggestKey::Down));
+        assert_eq!(app.room_mut().unwrap().suggest_index, 0);
+        // Enter takes the highlighted suggestion instead of sending the text.
+        let _ = app.update(Message::SendChat);
+        let room = app.room_mut().unwrap();
+        assert!(room.chat_input.starts_with("hi ") && !room.chat_input.contains(':'));
+        // Escape hides the list until the text changes again.
+        let _ = app.update(Message::ChatChanged("hi :smile".into()));
+        let _ = app.update(Message::ExitShareFullscreen);
+        assert_eq!(count(&mut app), 0);
+        let _ = app.update(Message::ChatChanged("hi :smil".into()));
+        assert!(count(&mut app) > 0);
     }
 
     fn peer() -> PeerId {

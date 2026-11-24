@@ -85,7 +85,7 @@ fn hairline(theme: &Theme) -> Color {
 
 /// Secondary text color.
 pub fn muted_color(theme: &Theme) -> Color {
-    alpha(theme.palette().text, 0.6)
+    alpha(theme.palette().text, 0.72)
 }
 
 /// Secondary text: labels, hints, counts.
@@ -165,14 +165,24 @@ fn filled(background: Color, text_color: Color, status: button::Status) -> butto
     }
 }
 
+/// Fill of a solid button. White text must stay readable on it, which the bright dark
+/// theme accents do not allow, so they are darkened there.
+fn solid(theme: &Theme, accent: Color) -> Color {
+    if is_dark(theme) {
+        Color::from_rgb(accent.r * 0.7, accent.g * 0.7, accent.b * 0.7)
+    } else {
+        accent
+    }
+}
+
 /// Main action.
 pub fn primary_button(theme: &Theme, status: button::Status) -> button::Style {
-    filled(theme.palette().primary, Color::WHITE, status)
+    filled(solid(theme, theme.palette().primary), Color::WHITE, status)
 }
 
 /// Destructive action.
 pub fn danger_button(theme: &Theme, status: button::Status) -> button::Style {
-    filled(theme.palette().danger, Color::WHITE, status)
+    filled(solid(theme, theme.palette().danger), Color::WHITE, status)
 }
 
 /// Neutral action on a quiet inset background.
@@ -229,7 +239,7 @@ pub fn input(theme: &Theme, status: text_input::Status) -> text_input::Style {
         background: Background::Color(inset(theme)),
         border: border::rounded(RADIUS).width(1).color(border_color),
         icon: muted_color(theme),
-        placeholder: alpha(palette.text, 0.4),
+        placeholder: alpha(palette.text, 0.68),
         value: palette.text,
         selection: alpha(palette.primary, 0.35),
     }
@@ -270,7 +280,7 @@ pub fn pick(theme: &Theme, status: pick_list::Status) -> pick_list::Style {
     };
     pick_list::Style {
         text_color: palette.text,
-        placeholder_color: alpha(palette.text, 0.4),
+        placeholder_color: alpha(palette.text, 0.68),
         handle_color: muted_color(theme),
         background: Background::Color(inset(theme)),
         border: border::rounded(RADIUS).width(1).color(border_color),
@@ -373,8 +383,79 @@ pub fn avatar(theme: &Theme, fill: Color, radius: f32, speaking: bool) -> contai
     };
     container::Style::default()
         .background(fill)
-        .color(Color::WHITE)
+        .color(readable_on(fill))
         .border(border::rounded(radius).width(2).color(ring))
+}
+
+/// Relative luminance (WCAG 2).
+fn luminance(c: Color) -> f32 {
+    let channel = |v: f32| {
+        if v <= 0.03928 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(c.r) + 0.7152 * channel(c.g) + 0.0722 * channel(c.b)
+}
+
+/// WCAG contrast ratio between two opaque colors.
+fn contrast(a: Color, b: Color) -> f32 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// White or near-black, whichever reads better on `fill`.
+fn readable_on(fill: Color) -> Color {
+    let dark = color!(0x111318);
+    if contrast(Color::WHITE, fill) >= contrast(dark, fill) {
+        Color::WHITE
+    } else {
+        dark
+    }
+}
+
+/// A suggestion row: highlighted when it is the one Enter or Tab will take.
+pub fn suggestion(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        let base = ghost_button(theme, status);
+        if selected {
+            button::Style {
+                background: Some(Background::Color(alpha(theme.palette().primary, 0.25))),
+                border: border::rounded(RADIUS)
+                    .width(1)
+                    .color(theme.palette().primary),
+                ..base
+            }
+        } else {
+            base
+        }
+    }
+}
+
+/// The "you are sharing" strip: tinted with the danger color like a recording light.
+pub fn sharing_banner(theme: &Theme) -> container::Style {
+    let danger = theme.palette().danger;
+    container::Style::default()
+        .background(alpha(danger, 0.14))
+        .border(border::rounded(RADIUS).width(1).color(alpha(danger, 0.5)))
+}
+
+/// A small round status dot.
+pub fn dot(color: Color) -> container::Style {
+    container::Style::default()
+        .background(color)
+        .border(border::rounded(u32::MAX))
+}
+
+/// Dot color for a peer connection: green, amber or red.
+pub fn connection_color(theme: &Theme, good: Option<bool>) -> Color {
+    let palette = theme.palette();
+    match good {
+        Some(true) => palette.success,
+        Some(false) => palette.danger,
+        None => palette.warning,
+    }
 }
 
 /// Loudness band of a level meter segment.
@@ -401,4 +482,59 @@ pub fn meter_segment(theme: &Theme, zone: MeterZone, lit: bool) -> container::St
     container::Style::default()
         .background(fill)
         .border(border::rounded(2))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `top` painted over `base` at its own alpha.
+    fn over(top: Color, base: Color) -> Color {
+        Color::from_rgb(
+            top.r * top.a + base.r * (1.0 - top.a),
+            top.g * top.a + base.g * (1.0 - top.a),
+            top.b * top.a + base.b * (1.0 - top.a),
+        )
+    }
+
+    fn themes() -> [Theme; 2] {
+        [DARK.clone(), LIGHT.clone()]
+    }
+
+    #[test]
+    fn secondary_text_is_readable_on_every_surface() {
+        for theme in themes() {
+            for ground in [theme.palette().background, surface(&theme), inset(&theme)] {
+                let ratio = contrast(over(muted_color(&theme), ground), ground);
+                assert!(ratio >= 4.5, "{} muted text: {ratio}", theme);
+            }
+        }
+    }
+
+    #[test]
+    fn placeholders_are_readable_on_fields() {
+        for theme in themes() {
+            let field = inset(&theme);
+            let placeholder = alpha(theme.palette().text, 0.68);
+            let ratio = contrast(over(placeholder, field), field);
+            assert!(ratio >= 4.5, "{} placeholder: {ratio}", theme);
+        }
+    }
+
+    #[test]
+    fn solid_buttons_have_readable_labels() {
+        for theme in themes() {
+            for accent in [theme.palette().primary, theme.palette().danger] {
+                let ratio = contrast(Color::WHITE, solid(&theme, accent));
+                assert!(ratio >= 4.5, "{} button: {ratio}", theme);
+            }
+        }
+    }
+
+    #[test]
+    fn avatar_initials_are_readable() {
+        for fill in AVATAR_COLORS {
+            assert!(contrast(readable_on(fill), fill) >= 4.5, "{fill:?}");
+        }
+    }
 }

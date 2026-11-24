@@ -21,6 +21,18 @@ server environment and the client config, can gate signaling. No JavaScript, no 
 | [docs/DECISIONS.md](docs/DECISIONS.md)       | Decision log (ADR style)                                     |
 | [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md)     | Requirement-by-requirement evidence                          |
 
+## Screenshots
+
+| Connect | Rooms |
+| --- | --- |
+| ![Connect screen](docs/screenshots/connect.png) | ![Room list](docs/screenshots/lobby.png) |
+
+| Voice and text chat | `:word` emoji suggestions |
+| --- | --- |
+| ![Room with chat](docs/screenshots/chat.png) | ![Emoji suggestions while typing](docs/screenshots/suggestions.png) |
+
+![Emoji picker](docs/screenshots/emoji-picker.png)
+
 ## Quick start (local, no TLS, no TURN)
 
 ```sh

@@ -15,7 +15,7 @@ use super::{
     App, Lobby, Message, RoomScreen, SYSTEM_DEFAULT, Screen, SharePicker, emoji, meter, selectable,
     style,
 };
-use crate::config::ThemeChoice;
+use crate::config::{Config, ThemeChoice};
 
 const SPACING: u32 = 8;
 const PADDING: u16 = 16;
@@ -36,10 +36,9 @@ const PERCENT_WIDTH: u32 = 36;
 type ButtonStyle = fn(&Theme, button::Status) -> button::Style;
 
 pub(super) fn view(app: &App) -> Element<'_, Message> {
-    let theme = app.config.theme;
     let body = match &app.state.screen {
         Screen::Connect { connecting } => connect_view(app, *connecting),
-        Screen::Lobby(lobby) => lobby_view(lobby, theme),
+        Screen::Lobby(lobby) => lobby_view(lobby, &app.config),
         Screen::Room(room) => room_view(app, room),
     };
     let mut page = Column::new().push(container(body).height(Length::Fill));
@@ -74,24 +73,52 @@ fn input<'a>(placeholder: &str, value: &str) -> TextInput<'a, Message> {
         .style(style::input)
 }
 
-/// Small round sun or moon button that switches between light and dark.
-fn theme_toggle(theme: ThemeChoice) -> Element<'static, Message> {
-    let (glyph, tip) = match theme {
-        ThemeChoice::Dark => ("☼", "Light theme"),
-        ThemeChoice::Light => ("☾", "Dark theme"),
+/// Theme (Auto, Light, Dark) and interface size controls, with text labels.
+fn display_controls(config: &Config) -> Element<'static, Message> {
+    let (label, tip) = if config.follow_system_theme {
+        ("Auto", "Following the system theme. Click for light")
+    } else if config.theme == ThemeChoice::Light {
+        ("Light", "Light theme. Click for dark")
+    } else {
+        ("Dark", "Dark theme. Click for auto")
     };
-    tooltip(
-        button(text(glyph).size(16).center())
-            .width(32)
-            .height(32)
-            .padding(0)
-            .style(style::icon_button)
-            .on_press(Message::ToggleTheme),
-        container(text(tip).size(12))
-            .padding([4, 8])
-            .style(style::floating),
-        tooltip::Position::Bottom,
-    )
+    let tipped = |content: Element<'static, Message>, tip: &'static str| {
+        tooltip(
+            content,
+            container(text(tip).size(12))
+                .padding([4, 8])
+                .style(style::floating),
+            tooltip::Position::Bottom,
+        )
+    };
+    row![
+        tipped(
+            button(text("A-").size(13))
+                .padding([6, 8])
+                .style(style::icon_button)
+                .on_press(Message::UiScaleStep(-1))
+                .into(),
+            "Smaller interface (Ctrl+-)",
+        ),
+        tipped(
+            button(text("A+").size(13))
+                .padding([6, 8])
+                .style(style::icon_button)
+                .on_press(Message::UiScaleStep(1))
+                .into(),
+            "Larger interface (Ctrl+=, Ctrl+0 resets)",
+        ),
+        tipped(
+            button(text(label).size(13))
+                .padding([6, 10])
+                .style(style::icon_button)
+                .on_press(Message::ToggleTheme)
+                .into(),
+            tip,
+        ),
+    ]
+    .spacing(4)
+    .align_y(Alignment::Center)
     .into()
 }
 
@@ -252,7 +279,7 @@ fn connect_view(app: &App, connecting: bool) -> Element<'_, Message> {
                 .style(style::scroll),
         )
         .center(Length::Fill),
-        container(theme_toggle(config.theme))
+        container(display_controls(config))
             .align_right(Length::Fill)
             .padding(PADDING),
     ]
@@ -301,7 +328,7 @@ fn labeled<'a>(label: &'a str, field: Element<'a, Message>) -> Element<'a, Messa
         .into()
 }
 
-fn lobby_view(lobby: &Lobby, theme: ThemeChoice) -> Element<'_, Message> {
+fn lobby_view<'a>(lobby: &'a Lobby, config: &Config) -> Element<'a, Message> {
     let count = match lobby.rooms.len() {
         0 => "No rooms open".to_owned(),
         1 => "1 room open".to_owned(),
@@ -316,7 +343,7 @@ fn lobby_view(lobby: &Lobby, theme: ThemeChoice) -> Element<'_, Message> {
         .width(Length::Fill),
         action("Refresh", style::ghost_button).on_press(Message::RefreshRooms),
         action("Disconnect", style::ghost_button).on_press(Message::Disconnect),
-        theme_toggle(theme),
+        display_controls(config),
     ]
     .spacing(SPACING)
     .align_y(Alignment::Center);
@@ -423,6 +450,15 @@ fn member_row(member: &MemberView) -> Element<'_, Message> {
             style::ghost_button
         })
         .on_press(Message::PeerMuteToggled(id, !member.muted));
+    let good = match member.state {
+        Some(PeerConnectionState::Connected) => Some(true),
+        Some(PeerConnectionState::Failed | PeerConnectionState::Closed) => Some(false),
+        _ => None,
+    };
+    let dot = container(space())
+        .width(8)
+        .height(8)
+        .style(move |t: &Theme| style::dot(style::connection_color(t, good)));
     column![
         row![
             identity(
@@ -430,6 +466,7 @@ fn member_row(member: &MemberView) -> Element<'_, Message> {
                 state_label(member.state).to_owned(),
                 member.speaking() && !member.muted,
             ),
+            dot,
             mute,
         ]
         .spacing(SPACING)
@@ -485,7 +522,7 @@ fn members_panel(room: &RoomScreen) -> Element<'_, Message> {
 
 fn chat_panel<'a>(
     room: &'a RoomScreen,
-    theme: ThemeChoice,
+    dark: bool,
     usage: &BTreeMap<String, u32>,
 ) -> Element<'a, Message> {
     let model = &room.model;
@@ -501,14 +538,11 @@ fn chat_panel<'a>(
         // Positional on purpose: iced 0.14's keyed column re-matches every existing row
         // when a line is appended (see `CHAT_TRIM_BATCH` for the trim side).
         let mut log = Column::new().spacing(SPACING + 4).width(Length::Fill);
-        let link_color = match theme {
-            ThemeChoice::Dark => &style::DARK,
-            ThemeChoice::Light => &style::LIGHT,
-        }
-        .extended_palette()
-        .primary
-        .base
-        .color;
+        let link_color = if dark { &style::DARK } else { &style::LIGHT }
+            .extended_palette()
+            .primary
+            .base
+            .color;
         for msg in &model.chat {
             log = log.push(selectable::message(
                 msg.id,
@@ -527,6 +561,7 @@ fn chat_panel<'a>(
             .into()
     };
     let input = input("Message (Enter to send)", &room.chat_input)
+        .id(super::CHAT_INPUT_ID)
         .on_input(Message::ChatChanged)
         .on_submit(Message::SendChat);
     let emoji_toggle = tooltip(
@@ -542,8 +577,8 @@ fn chat_panel<'a>(
         tooltip::Position::Top,
     );
     let send_button = tooltip(
-        button(text("➤").size(16).center())
-            .width(36)
+        button(text("Send").size(14).center())
+            .width(56)
             .height(36)
             .padding(0)
             .style(style::primary_button)
@@ -556,20 +591,32 @@ fn chat_panel<'a>(
     let input_row = row![input, emoji_toggle, send_button]
         .spacing(SPACING)
         .align_y(Alignment::Center);
-    let mut panel = Column::new()
-        .push(mouse_area(log).on_press(Message::CloseEmojiPicker))
-        .spacing(SPACING + 4)
-        .height(Length::Fill);
-    if room.emoji_open {
-        panel = panel.push(
-            container(emoji_picker(&room.emoji_query, usage))
-                .width(Length::Fill)
-                .align_x(Alignment::End),
-        );
-    } else if let Some(suggestions) = emoji_suggestions(&room.chat_input) {
-        panel = panel.push(container(suggestions).width(Length::Fill));
-    }
-    container(panel.push(input_row))
+    // The popup slot is always present so the input row keeps its position in the widget
+    // tree; inserting a child before it would hand it the popup's state and drop its focus.
+    let gap = (SPACING + 4) as f32;
+    let popup: Element<'_, Message> = if room.emoji_open {
+        container(emoji_picker(&room.emoji_query, usage))
+            .width(Length::Fill)
+            .align_x(Alignment::End)
+            .padding(Padding::ZERO.bottom(gap))
+            .into()
+    } else if !room.suggestions().is_empty() {
+        container(emoji_suggestions(room))
+            .width(Length::Fill)
+            .padding(Padding::ZERO.bottom(gap))
+            .into()
+    } else {
+        space().into()
+    };
+    let panel = column![
+        container(mouse_area(log).on_press(Message::CloseEmojiPicker))
+            .height(Length::Fill)
+            .padding(Padding::ZERO.bottom(gap)),
+        popup,
+        input_row,
+    ]
+    .height(Length::Fill);
+    container(panel)
         .padding(14)
         .height(Length::Fill)
         .style(style::card)
@@ -655,30 +702,28 @@ fn emoji_picker<'a>(query: &str, usage: &BTreeMap<String, u32>) -> Element<'a, M
         .into()
 }
 
-/// `:word` suggestions above the chat input.
-fn emoji_suggestions<'a>(chat_input: &str) -> Option<Element<'a, Message>> {
-    let (_, word) = emoji::pending_query(chat_input)?;
-    let hits = emoji::search(word, 6);
-    if hits.is_empty() {
-        return None;
-    }
-    let rows = Column::with_children(hits.into_iter().map(|e| {
+/// `:word` suggestions above the chat input; Up, Down, Tab and Enter drive them.
+fn emoji_suggestions(room: &RoomScreen) -> Element<'_, Message> {
+    let rows = Column::with_children(room.suggestions().into_iter().enumerate().map(|(i, e)| {
         let label = format!("{}  :{}:", e.as_str(), e.shortcode().unwrap_or(e.name()));
         button(text(label).size(15))
             .width(Length::Fill)
             .padding([4, 8])
-            .style(style::icon_button)
+            .style(style::suggestion(i == room.suggest_index))
             .on_press(Message::CompleteEmoji(e.as_str()))
             .into()
     }))
-    .spacing(2);
-    Some(
-        container(rows)
-            .padding(6)
-            .width(Length::Fixed(EMOJI_PICKER_WIDTH))
-            .style(style::popup)
-            .into(),
+    .push(
+        text("Up/Down to choose, Tab or Enter to insert, Esc to dismiss")
+            .size(11)
+            .style(style::muted),
     )
+    .spacing(2);
+    container(rows)
+        .padding(6)
+        .width(Length::Fixed(EMOJI_PICKER_WIDTH))
+        .style(style::popup)
+        .into()
 }
 
 fn small_label(label: &str) -> Element<'_, Message> {
@@ -838,6 +883,25 @@ fn audio_panel<'a>(app: &'a App, room: &'a RoomScreen) -> Element<'a, Message> {
         ),
     ]
     .spacing(SPACING * 2);
+    let ptt = row![
+        checkbox(config.push_to_talk)
+            .label("Push to talk (hold the key to speak; works while Chattercrab is focused)")
+            .size(16)
+            .text_size(14)
+            .style(style::check)
+            .on_toggle(Message::PushToTalk),
+        space().width(Length::Fill),
+        pick_list(
+            &crate::config::PTT_KEYS[..],
+            Some(config.ptt_key.as_str()),
+            |key: &str| Message::PttKeySelected(key.to_owned()),
+        )
+        .padding(FIELD_PADDING)
+        .style(style::pick)
+        .menu_style(style::menu),
+    ]
+    .spacing(SPACING)
+    .align_y(Alignment::Center);
     container(
         column![
             title,
@@ -849,6 +913,7 @@ fn audio_panel<'a>(app: &'a App, room: &'a RoomScreen) -> Element<'a, Message> {
                 .text_size(14)
                 .style(style::check)
                 .on_toggle(Message::NoiseSuppression),
+            ptt,
         ]
         .spacing(SPACING + 4),
     )
@@ -881,12 +946,26 @@ fn bottom_bar<'a>(app: &'a App, room: &'a RoomScreen) -> Element<'a, Message> {
             style::secondary_button
         }
     };
-    let controls = row![
+    let mute: Element<'_, Message> = if app.config.push_to_talk {
+        let label = if model.muted {
+            format!("Hold {} to talk", app.config.ptt_key)
+        } else {
+            "Talking".to_owned()
+        };
+        button(text(label).size(14))
+            .padding([8, 14])
+            .style(toggle_style(!model.muted))
+            .into()
+    } else {
         action(
             if model.muted { "Unmute" } else { "Mute" },
-            toggle_style(model.muted)
+            toggle_style(model.muted),
         )
-        .on_press(Message::ToggleMute),
+        .on_press(Message::ToggleMute)
+        .into()
+    };
+    let controls = row![
+        mute,
         action(
             if model.deafened { "Undeafen" } else { "Deafen" },
             toggle_style(model.deafened),
@@ -992,32 +1071,50 @@ fn room_view<'a>(app: &'a App, room: &'a RoomScreen) -> Element<'a, Message> {
             action("Fullscreen", style::ghost_button).on_press(Message::ToggleShareFullscreen),
         );
     }
-    header = header.push(theme_toggle(app.config.theme));
+    header = header.push(display_controls(&app.config));
 
     let center: Element<'_, Message> = if model.remote_share_active() {
         row![
             container(share_stage(room))
                 .width(Length::FillPortion(3))
                 .height(Length::Fill),
-            container(chat_panel(room, app.config.theme, &app.config.emoji_usage))
+            container(chat_panel(room, app.is_dark(), &app.config.emoji_usage))
                 .width(Length::Fixed(300.0)),
         ]
         .spacing(SPACING + 4)
         .into()
     } else {
-        chat_panel(room, app.config.theme, &app.config.emoji_usage)
+        chat_panel(room, app.is_dark(), &app.config.emoji_usage)
     };
 
-    column![
-        header,
-        row![members_panel(room), center]
-            .spacing(SPACING + 4)
-            .height(Length::Fill),
-        bottom_bar(app, room),
-    ]
-    .spacing(SPACING + 4)
-    .padding(PADDING)
-    .into()
+    let sharing_banner: Option<Element<'_, Message>> = model.local_sharing.then(|| {
+        container(
+            row![
+                text("You are sharing your screen")
+                    .size(14)
+                    .width(Length::Fill),
+                action("Stop sharing", style::danger_button).on_press(Message::StopShare),
+            ]
+            .spacing(SPACING)
+            .align_y(Alignment::Center),
+        )
+        .padding([6, 12])
+        .width(Length::Fill)
+        .style(style::sharing_banner)
+        .into()
+    });
+
+    column![header]
+        .extend(sharing_banner)
+        .push(
+            row![members_panel(room), center]
+                .spacing(SPACING + 4)
+                .height(Length::Fill),
+        )
+        .push(bottom_bar(app, room))
+        .spacing(SPACING + 4)
+        .padding(PADDING)
+        .into()
 }
 
 #[cfg(test)]

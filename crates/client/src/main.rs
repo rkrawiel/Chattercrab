@@ -151,11 +151,14 @@ fn main() -> anyhow::Result<()> {
     let boot_tx = cmd_tx.clone();
     let result = iced::application(
         move || {
-            App::new(
-                config.clone(),
-                writer.clone(),
-                boot_tx.clone(),
-                events.clone(),
+            (
+                App::new(
+                    config.clone(),
+                    writer.clone(),
+                    boot_tx.clone(),
+                    events.clone(),
+                ),
+                App::system_theme_task(),
             )
         },
         App::update,
@@ -163,6 +166,7 @@ fn main() -> anyhow::Result<()> {
     )
     .title(App::title)
     .theme(App::theme)
+    .scale_factor(App::scale_factor)
     .subscription(App::subscription)
     // No canvas or meshes are drawn, so MSAA would only cost GPU memory.
     .antialiasing(false)
